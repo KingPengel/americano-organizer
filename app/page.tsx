@@ -14,11 +14,15 @@ type SavedRound = {
   results: Record<number, { scoreA: number; scoreB: number }>;
 };
 
-type PersistedState = {
-  version: 2;
+type PersistedStateV3 = {
+  version: 3;
   tournamentName: string;
+
   setupDone: boolean;
   targetRounds: number;
+
+  // NEW
+  extraMode: boolean;
 
   manualEnded?: boolean;
 
@@ -30,7 +34,7 @@ type PersistedState = {
   savedRounds: SavedRound[];
 };
 
-const STORAGE_KEY = "americano_app_state_v2";
+const STORAGE_KEY = "americano_app_state_v3";
 
 function fmtTime(ts: number) {
   const d = new Date(ts);
@@ -48,11 +52,11 @@ function safeParse<T>(raw: string | null): T | null {
   }
 }
 
-// --- Fairness stats from history ---
 function makeKey(a: string, b: string) {
   return a < b ? `${a}__${b}` : `${b}__${a}`;
 }
 
+// --- Coverage stats (partner/opponent) from history ---
 function computeStats(players: Player[], savedRounds: SavedRound[]) {
   const gamesPlayed: Record<string, number> = {};
   const partnerCount: Record<string, number> = {};
@@ -93,6 +97,41 @@ function computeStats(players: Player[], savedRounds: SavedRound[]) {
   return { gamesPlayed, partnerCount, opponentCount };
 }
 
+// --- Partner-Coverage helper ---
+function partnerCoverage(players: Player[], savedRounds: SavedRound[]) {
+  const n = players.length;
+  if (n <= 1) return { complete: true, percent: 100, missingPairs: 0, totalPairs: 0 };
+
+  const totalPairs = (n * (n - 1)) / 2;
+  const seenPairs = new Set<string>();
+
+  for (const round of savedRounds) {
+    for (const m of round.matches) {
+      const a = makeKey(m.teamA[0].id, m.teamA[1].id);
+      const b = makeKey(m.teamB[0].id, m.teamB[1].id);
+      seenPairs.add(a);
+      seenPairs.add(b);
+    }
+  }
+
+  const done = seenPairs.size;
+  const percent = Math.max(0, Math.min(100, Math.round((done / totalPairs) * 100)));
+  const missingPairs = Math.max(0, totalPairs - done);
+  return { complete: done >= totalPairs, percent, missingPairs, totalPairs };
+}
+
+// --- Recommended rounds for partner coverage (fair even with bench) ---
+// Lower bound to see all unique partnerships, given courts limit and rotations.
+function recommendRoundsPartner(playerCount: number, courts: number) {
+  if (playerCount < 4) return 0;
+  const c = Math.max(1, Math.min(courts, Math.floor(playerCount / 4) || 1));
+  // ceil( n*(n-1) / (4*c) )
+  const num = playerCount * (playerCount - 1);
+  const den = 4 * c;
+  return Math.max(1, Math.ceil(num / den));
+}
+
+// --- Fair round generator (uses partner/opponent penalties) ---
 function generateFairRound(params: {
   players: Player[];
   courtsWanted: number;
@@ -107,6 +146,7 @@ function generateFairRound(params: {
 
   const { gamesPlayed, partnerCount, opponentCount } = computeStats(players, savedRounds);
 
+  // Bias to let low-games players play first (bench rotation fairness)
   const shuffled = [...players].sort(() => Math.random() - 0.5);
   const byGames = shuffled.sort(
     (a, b) => (gamesPlayed[a.id] ?? 0) - (gamesPlayed[b.id] ?? 0)
@@ -122,7 +162,10 @@ function generateFairRound(params: {
   const gp = (x: string) => gamesPlayed[x] ?? 0;
 
   function matchScore(a: Player, b: Player, c: Player, d: Player) {
-    const partnerPenalty = 10 * partner(a.id, b.id) + 10 * partner(c.id, d.id);
+    // Partner repeats hurt most (partner coverage goal)
+    const partnerPenalty = 14 * partner(a.id, b.id) + 14 * partner(c.id, d.id);
+
+    // Opponent repeats mild penalty (still adds variety)
     const opponentPenalty =
       3 *
       (opp(a.id, c.id) +
@@ -130,7 +173,9 @@ function generateFairRound(params: {
         opp(b.id, c.id) +
         opp(b.id, d.id));
 
+    // Small bonus to include low-games players sooner
     const playtimeBonus = -0.25 * (gp(a.id) + gp(b.id) + gp(c.id) + gp(d.id));
+
     return partnerPenalty + opponentPenalty + playtimeBonus;
   }
 
@@ -191,11 +236,6 @@ function generateFairRound(params: {
   return { matches, bench };
 }
 
-function recommendRounds(playerCount: number) {
-  if (playerCount <= 1) return 0;
-  return Math.max(1, playerCount - 1);
-}
-
 // ---- EXPORT HELPERS ----
 function buildFinalRankingText(params: {
   tournamentName: string;
@@ -203,12 +243,15 @@ function buildFinalRankingText(params: {
   totalRanking: { name: string; points: number }[];
   targetRounds: number;
   manualEnded: boolean;
+  extraMode: boolean;
 }) {
-  const { tournamentName, savedRounds, totalRanking, targetRounds, manualEnded } = params;
+  const { tournamentName, savedRounds, totalRanking, targetRounds, manualEnded, extraMode } = params;
   const header = `🏆 ${tournamentName}\n`;
   const meta = manualEnded
     ? `Beendet (manuell) • Runden: ${savedRounds.length}\n`
-    : `Runden: ${Math.min(savedRounds.length, targetRounds)}/${targetRounds}\n`;
+    : extraMode
+      ? `Extra-Modus • Runden: ${savedRounds.length} (Ziel war ${targetRounds})\n`
+      : `Runden: ${Math.min(savedRounds.length, targetRounds)}/${targetRounds}\n`;
 
   const rankingLines = totalRanking.map((r, i) => `${i + 1}. ${r.name} — ${r.points}`);
 
@@ -221,20 +264,23 @@ function buildFullReportText(params: {
   totalRanking: { name: string; points: number }[];
   targetRounds: number;
   manualEnded: boolean;
+  extraMode: boolean;
 }) {
-  const { tournamentName, savedRounds, totalRanking, targetRounds, manualEnded } = params;
+  const { tournamentName, savedRounds, totalRanking, targetRounds, manualEnded, extraMode } = params;
 
   const header = `🏆 ${tournamentName}\n`;
   const meta = manualEnded
     ? `Beendet (manuell) • Gespeicherte Runden: ${savedRounds.length}\n`
-    : `Gespeicherte Runden: ${Math.min(savedRounds.length, targetRounds)}/${targetRounds}\n`;
+    : extraMode
+      ? `Extra-Modus • Gespeicherte Runden: ${savedRounds.length} (Ziel war ${targetRounds})\n`
+      : `Gespeicherte Runden: ${Math.min(savedRounds.length, targetRounds)}/${targetRounds}\n`;
 
   const roundsBlock =
     savedRounds.length === 0
       ? "Keine gespeicherten Runden.\n"
       : savedRounds
           .slice()
-          .reverse() // oldest -> newest for nicer reading
+          .reverse()
           .map((round, idx) => {
             const roundNo = idx + 1;
             const time = fmtTime(round.createdAt);
@@ -262,10 +308,10 @@ export default function Home() {
 
   const [setupPlayerCount, setSetupPlayerCount] = useState<number>(8);
   const [setupNames, setSetupNames] = useState<string[]>(
-    Array.from({ length: 8 }, (_, i) => `Spieler ${i + 1}`)
+    Array.from({ length: 8 }, () => "")
   );
   const [setupCourts, setSetupCourts] = useState<number>(2);
-  const [targetRounds, setTargetRounds] = useState<number>(recommendRounds(8));
+  const [targetRounds, setTargetRounds] = useState<number>(recommendRoundsPartner(8, 2));
 
   // Main app state
   const [name, setName] = useState("");
@@ -277,6 +323,9 @@ export default function Home() {
   const [savedRounds, setSavedRounds] = useState<SavedRound[]>([]);
   const [manualEnded, setManualEnded] = useState<boolean>(false);
 
+  // NEW
+  const [extraMode, setExtraMode] = useState<boolean>(false);
+
   const [error, setError] = useState<string>("");
   const [toast, setToast] = useState<string>("");
 
@@ -284,11 +333,16 @@ export default function Home() {
 
   // --- LOAD once on mount ---
   useEffect(() => {
-    const parsed = safeParse<PersistedState>(localStorage.getItem(STORAGE_KEY));
-    if (parsed && parsed.version === 2) {
+    // Backward compatibility: try old key too (if exists)
+    const legacy = safeParse<any>(localStorage.getItem("americano_app_state_v2"));
+    const parsed = safeParse<PersistedStateV3>(localStorage.getItem(STORAGE_KEY));
+
+    if (parsed && parsed.version === 3) {
       setTournamentName(parsed.tournamentName ?? "Mein Americano");
       setSetupDone(parsed.setupDone ?? false);
       setTargetRounds(parsed.targetRounds ?? 0);
+
+      setExtraMode(parsed.extraMode ?? false);
 
       setManualEnded(parsed.manualEnded ?? false);
 
@@ -298,18 +352,38 @@ export default function Home() {
       setMatches(parsed.matches ?? []);
       setResults(parsed.results ?? {});
       setSavedRounds(parsed.savedRounds ?? []);
+    } else if (legacy && legacy.version === 2) {
+      // Migrate v2 -> v3
+      setTournamentName(legacy.tournamentName ?? "Mein Americano");
+      setSetupDone(legacy.setupDone ?? false);
+      setTargetRounds(legacy.targetRounds ?? 0);
+
+      setExtraMode(false);
+
+      setManualEnded(legacy.manualEnded ?? false);
+
+      setPlayers(legacy.players ?? []);
+      setCourts(legacy.courts ?? 1);
+
+      setMatches(legacy.matches ?? []);
+      setResults(legacy.results ?? {});
+      setSavedRounds(legacy.savedRounds ?? []);
+
+      localStorage.removeItem("americano_app_state_v2");
     }
+
     setLoadedFromStorage(true);
   }, []);
 
   // --- SAVE whenever state changes ---
   useEffect(() => {
     if (!loadedFromStorage) return;
-    const payload: PersistedState = {
-      version: 2,
+    const payload: PersistedStateV3 = {
+      version: 3,
       tournamentName,
       setupDone,
       targetRounds,
+      extraMode,
       manualEnded,
       players,
       courts,
@@ -323,6 +397,7 @@ export default function Home() {
     tournamentName,
     setupDone,
     targetRounds,
+    extraMode,
     manualEnded,
     players,
     courts,
@@ -343,20 +418,37 @@ export default function Home() {
     setSetupNames((prev) => {
       const next = [...prev];
       if (setupPlayerCount > next.length) {
-        for (let i = next.length; i < setupPlayerCount; i++) next.push(`Spieler ${i + 1}`);
+        for (let i = next.length; i < setupPlayerCount; i++) next.push("");
       } else if (setupPlayerCount < next.length) {
         next.length = setupPlayerCount;
       }
       return next;
     });
-    setTargetRounds(recommendRounds(setupPlayerCount));
   }, [setupPlayerCount]);
+
+  // Update recommended rounds when player count or courts change
+  useEffect(() => {
+    const rec = recommendRoundsPartner(setupPlayerCount, setupCourts);
+    setTargetRounds((curr) => {
+      // If user never touched rounds much, keep it aligned
+      // but if they changed it significantly, don't fight them.
+      // Simple rule: if curr equals previous recommendation (roughly),
+      // update it; otherwise keep their value.
+      // We'll just update if curr is 0 or curr is close to rec (±1).
+      if (curr <= 0) return rec;
+      if (Math.abs(curr - rec) <= 1) return rec;
+      return curr;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [setupPlayerCount, setupCourts]);
 
   const maxCourtsPossible = Math.max(1, Math.floor(players.length / 4));
   const effectiveCourts = Math.min(Math.max(1, courts), maxCourtsPossible);
 
+  const coverage = useMemo(() => partnerCoverage(players, savedRounds), [players, savedRounds]);
+
   const tournamentFinished =
-    manualEnded || (targetRounds > 0 && savedRounds.length >= targetRounds);
+    manualEnded || (!extraMode && targetRounds > 0 && savedRounds.length >= targetRounds);
 
   const sortedPlayers = useMemo(() => {
     return [...players].sort((a, b) => a.name.localeCompare(b.name, "de"));
@@ -367,6 +459,7 @@ export default function Home() {
     setSetupDone(false);
     setTargetRounds(0);
     setManualEnded(false);
+    setExtraMode(false);
 
     setPlayers([]);
     setCourts(1);
@@ -382,17 +475,14 @@ export default function Home() {
   function newTournamentFromCurrent() {
     setError("");
     setSetupPlayerCount(Math.max(4, players.length || 8));
-    setSetupNames(
-      players.length > 0
-        ? players.map((p) => p.name)
-        : Array.from({ length: 8 }, (_, i) => `Spieler ${i + 1}`)
-    );
+    setSetupNames(players.length > 0 ? players.map((p) => p.name) : Array.from({ length: 8 }, () => ""));
     setSetupCourts(courts || 1);
-    setTargetRounds(recommendRounds(Math.max(4, players.length || 8)));
+    setTargetRounds(recommendRoundsPartner(Math.max(4, players.length || 8), courts || 1));
     setSavedRounds([]);
     setMatches([]);
     setResults({});
     setManualEnded(false);
+    setExtraMode(false);
     setSetupDone(false);
   }
 
@@ -416,7 +506,7 @@ export default function Home() {
     setError("");
 
     if (tournamentFinished) {
-      setError("Turnier ist beendet. Starte ein neues Turnier, um weiterzuspielen.");
+      setError("Turnier ist beendet. Tippe auf „Extra-Runden spielen“ oder starte ein neues Turnier.");
       return;
     }
 
@@ -475,7 +565,7 @@ export default function Home() {
     setError("");
 
     if (tournamentFinished) {
-      setError("Turnier ist beendet. Starte ein neues Turnier, um weiterzuspielen.");
+      setError("Turnier ist beendet. Tippe auf „Extra-Runden spielen“ oder starte ein neues Turnier.");
       return;
     }
 
@@ -523,6 +613,12 @@ export default function Home() {
     setManualEnded(false);
   }
 
+  function playExtraRounds() {
+    setError("");
+    setManualEnded(false);
+    setExtraMode(true);
+  }
+
   const totalRanking = useMemo(() => {
     const points: Record<string, number> = {};
     players.forEach((p) => (points[p.id] = 0));
@@ -566,8 +662,6 @@ export default function Home() {
       points: points[p.id] ?? 0,
     }));
 
-    rows.sort((x, y) => y.points - y.points || x.name.localeCompare(y.name, "de"));
-    // ^ fix below (typo guard)
     rows.sort((x, y) => y.points - x.points || x.name.localeCompare(y.name, "de"));
     return rows;
   }, [matches, players, results]);
@@ -579,7 +673,7 @@ export default function Home() {
     });
   }, [matches, results]);
 
-  const roundsProgress = `${Math.min(savedRounds.length, targetRounds)}/${targetRounds || 0}`;
+  const roundsProgress = targetRounds > 0 ? `${Math.min(savedRounds.length, targetRounds)}/${targetRounds}` : `${savedRounds.length}`;
 
   async function copyToClipboard(text: string, okMessage: string) {
     try {
@@ -593,15 +687,20 @@ export default function Home() {
   function startTournamentFromSetup() {
     setError("");
 
+    const tName = tournamentName.trim();
     const names = setupNames.map((n) => n.trim());
-    if (tournamentName.trim().length < 2) {
+
+    if (tName.length < 2) {
       setError("Bitte einen Turniernamen eingeben.");
       return;
     }
+
+    // Allow empty fields BUT then they must use Auto-Fill or fill manually
     if (names.some((n) => n.length === 0)) {
-      setError("Bitte für alle Spieler:innen einen Namen eintragen.");
+      setError("Bitte für alle Spieler:innen einen Namen eintragen (oder Auto-Fill nutzen).");
       return;
     }
+
     if (setupCourts < 1) {
       setError("Bitte mindestens 1 Court auswählen.");
       return;
@@ -616,15 +715,16 @@ export default function Home() {
     setSavedRounds([]);
     setMatches([]);
     setResults({});
-    setTargetRounds(targetRounds || recommendRounds(setupPlayerCount));
+    setTargetRounds(targetRounds || recommendRoundsPartner(setupPlayerCount, fixedCourts));
     setManualEnded(false);
+    setExtraMode(false);
     setSetupDone(true);
   }
 
   // --- UI: Setup Wizard ---
   if (!setupDone) {
     const possibleCourtsSetup = Math.max(1, Math.floor(setupPlayerCount / 4));
-    const suggested = recommendRounds(setupPlayerCount);
+    const recommended = recommendRoundsPartner(setupPlayerCount, Math.min(setupCourts, possibleCourtsSetup));
 
     return (
       <main className="min-h-screen bg-gray-50 text-gray-900">
@@ -664,7 +764,28 @@ export default function Home() {
           </section>
 
           <section className="mt-6 rounded-2xl bg-white p-5 shadow-sm ring-1 ring-gray-200">
-            <h2 className="text-lg font-semibold">2) Spieler:innen</h2>
+            <div className="flex items-center justify-between gap-3">
+              <h2 className="text-lg font-semibold">2) Spieler:innen</h2>
+
+              <div className="flex flex-wrap gap-2">
+                <button
+                  onClick={() =>
+                    setSetupNames((prev) =>
+                      prev.map((v, i) => (v.trim().length === 0 ? `Spieler ${i + 1}` : v))
+                    )
+                  }
+                  className="rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm font-medium text-gray-800 shadow-sm hover:bg-gray-50"
+                >
+                  Auto-Fill
+                </button>
+                <button
+                  onClick={() => setSetupNames((prev) => prev.map(() => ""))}
+                  className="rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm font-medium text-gray-800 shadow-sm hover:bg-gray-50"
+                >
+                  Alle leeren
+                </button>
+              </div>
+            </div>
 
             <label className="mt-3 block text-sm text-gray-700">
               Anzahl Spieler:innen
@@ -683,6 +804,7 @@ export default function Home() {
                   Spieler {idx + 1}
                   <input
                     value={val}
+                    onFocus={(e) => e.currentTarget.select()}
                     onChange={(e) => {
                       const v = e.target.value;
                       setSetupNames((prev) => {
@@ -722,7 +844,7 @@ export default function Home() {
             </label>
 
             <label className="mt-4 block text-sm text-gray-700">
-              Runden (Vorschlag: {suggested})
+              Runden (Vorschlag: {recommended})
               <input
                 type="number"
                 min={1}
@@ -733,11 +855,10 @@ export default function Home() {
             </label>
 
             <div className="mt-4 rounded-xl bg-gray-50 p-4 text-sm text-gray-700">
-              <div className="font-semibold">So rechnen wir den Vorschlag</div>
+              <div className="font-semibold">Partner-Coverage (Padel)</div>
               <p className="mt-1">
-                Standard-Americano-Ziel: möglichst viele <span className="font-semibold">verschiedene Partner</span>.
-                Pro Runde hat jede Person genau <span className="font-semibold">1 Partner</span> → Vorschlag ={" "}
-                <span className="font-semibold">{setupPlayerCount - 1}</span> Runden.
+                Ziel: möglichst jede Paarung (Partner) mindestens einmal.
+                Der Vorschlag berücksichtigt Courts + Rotation (Pausen).
               </p>
             </div>
 
@@ -762,7 +883,9 @@ export default function Home() {
             <h1 className="text-3xl font-bold">{tournamentName}</h1>
             <p className="mt-2 text-gray-600">
               Fortschritt: <span className="font-semibold">{roundsProgress}</span> · Courts:{" "}
-              <span className="font-semibold">{effectiveCourts}</span> · Fairness aktiv
+              <span className="font-semibold">{effectiveCourts}</span> · Partner-Coverage:{" "}
+              <span className="font-semibold">{coverage.percent}%</span>
+              {extraMode ? <span className="ml-2 rounded-full bg-gray-100 px-2 py-1 text-xs">Extra</span> : null}
             </p>
           </div>
 
@@ -794,12 +917,20 @@ export default function Home() {
                     </>
                   ) : (
                     <>
-                      Du hast <span className="font-semibold">{targetRounds}</span> Runden gespeichert.
+                      Zielrunden erreicht: <span className="font-semibold">{targetRounds}</span>. Partner-Coverage:{" "}
+                      <span className="font-semibold">{coverage.percent}%</span>.
                     </>
                   )}
                 </div>
               </div>
               <div className="flex flex-wrap gap-2">
+                <button
+                  onClick={playExtraRounds}
+                  className="rounded-xl bg-black px-4 py-2 text-sm font-medium text-white shadow-sm hover:opacity-95"
+                >
+                  Extra-Runden spielen
+                </button>
+
                 {manualEnded && savedRounds.length < targetRounds && (
                   <button
                     onClick={resumeTournament}
@@ -808,6 +939,7 @@ export default function Home() {
                     Weiter spielen
                   </button>
                 )}
+
                 <button
                   onClick={() =>
                     copyToClipboard(
@@ -817,14 +949,16 @@ export default function Home() {
                         totalRanking: totalRanking.map((r) => ({ name: r.name, points: r.points })),
                         targetRounds,
                         manualEnded,
+                        extraMode,
                       }),
                       "Final Ranking kopiert ✅"
                     )
                   }
-                  className="rounded-xl bg-black px-4 py-2 text-sm font-medium text-white shadow-sm"
+                  className="rounded-xl border border-gray-200 bg-white px-4 py-2 text-sm font-medium text-gray-800 shadow-sm hover:bg-gray-50"
                 >
-                  Copy Final Ranking
+                  Copy Final
                 </button>
+
                 <button
                   onClick={() =>
                     copyToClipboard(
@@ -834,13 +968,14 @@ export default function Home() {
                         totalRanking: totalRanking.map((r) => ({ name: r.name, points: r.points })),
                         targetRounds,
                         manualEnded,
+                        extraMode,
                       }),
                       "Turnier-Report kopiert ✅"
                     )
                   }
                   className="rounded-xl border border-gray-200 bg-white px-4 py-2 text-sm font-medium text-gray-800 shadow-sm hover:bg-gray-50"
                 >
-                  Copy Turnier-Report
+                  Copy Report
                 </button>
 
                 <button
@@ -929,10 +1064,10 @@ export default function Home() {
             </ul>
 
             <div className="mt-4 rounded-xl bg-gray-50 p-4 text-sm text-gray-700">
-              <div className="font-semibold">Hinweis</div>
+              <div className="font-semibold">Partner-Coverage</div>
               <p className="mt-1">
-                Courts sind nach dem Setup fix. Aktuell:{" "}
-                <span className="font-semibold">{effectiveCourts}</span>
+                Aktuell: <span className="font-semibold">{coverage.percent}%</span>{" "}
+                ({coverage.totalPairs - coverage.missingPairs}/{coverage.totalPairs} Paarungen).
               </p>
             </div>
           </section>
@@ -990,6 +1125,7 @@ export default function Home() {
                       totalRanking: totalRanking.map((r) => ({ name: r.name, points: r.points })),
                       targetRounds,
                       manualEnded,
+                      extraMode,
                     }),
                     "Final Ranking kopiert ✅"
                   )
@@ -1008,6 +1144,7 @@ export default function Home() {
                       totalRanking: totalRanking.map((r) => ({ name: r.name, points: r.points })),
                       targetRounds,
                       manualEnded,
+                      extraMode,
                     }),
                     "Turnier-Report kopiert ✅"
                   )
@@ -1023,8 +1160,7 @@ export default function Home() {
                 <div className="rounded-xl border border-dashed border-gray-300 bg-gray-50 p-6 text-sm text-gray-700">
                   {tournamentFinished ? (
                     <span>
-                      Turnier beendet. <span className="font-semibold">Copy</span> oder{" "}
-                      <span className="font-semibold">Neues Turnier</span>.
+                      Turnier beendet. Tippe auf <span className="font-semibold">„Extra-Runden spielen“</span>.
                     </span>
                   ) : (
                     <span>
@@ -1237,11 +1373,10 @@ export default function Home() {
             </div>
 
             <div className="mt-4 rounded-xl bg-gray-50 p-4 text-sm text-gray-700">
-              <div className="font-semibold">Jetzt testen wie eine App</div>
-              <ul className="mt-2 list-disc space-y-1 pl-5">
-                <li>Im Handy-Browser im WLAN öffnen (Network-URL aus Terminal)</li>
-                <li>Dann Share → „Zum Home-Bildschirm“ (iPhone) / „Installieren“ (Android)</li>
-              </ul>
+              <div className="font-semibold">Tipp</div>
+              <p className="mt-1">
+                Wenn du nach Ende weiter spielen willst: <span className="font-semibold">Extra-Runden spielen</span>.
+              </p>
             </div>
           </section>
         </div>
