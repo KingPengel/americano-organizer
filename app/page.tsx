@@ -14,34 +14,32 @@ type SavedRound = {
   results: Record<number, { scoreA: number; scoreB: number }>;
 };
 
-type PersistedStateV3 = {
-  version: 3;
+type PersistedStateV4 = {
+  version: 4;
+
   tournamentName: string;
-
   setupDone: boolean;
-  targetRounds: number;
-
-  // NEW
-  extraMode: boolean;
-
-  manualEnded?: boolean;
 
   players: Player[];
   courts: number;
+  targetRounds: number;
 
+  // tournament lifecycle
+  manualEnded: boolean;
+  extraMode: boolean;
+
+  // active round
   matches: Match[];
   results: Record<number, MatchResult>;
+
+  // history
   savedRounds: SavedRound[];
+
+  // ui
+  activeTab: "play" | "ranking" | "history";
 };
 
-const STORAGE_KEY = "americano_app_state_v3";
-
-function fmtTime(ts: number) {
-  const d = new Date(ts);
-  const hh = String(d.getHours()).padStart(2, "0");
-  const mm = String(d.getMinutes()).padStart(2, "0");
-  return `${hh}:${mm}`;
-}
+const STORAGE_KEY = "americano_app_state_v4";
 
 function safeParse<T>(raw: string | null): T | null {
   if (!raw) return null;
@@ -56,7 +54,45 @@ function makeKey(a: string, b: string) {
   return a < b ? `${a}__${b}` : `${b}__${a}`;
 }
 
-// --- Coverage stats (partner/opponent) from history ---
+function fmtTime(ts: number) {
+  const d = new Date(ts);
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  return `${hh}:${mm}`;
+}
+
+// --- Partner-Coverage (unique partnerships) ---
+function partnerCoverage(players: Player[], savedRounds: SavedRound[]) {
+  const n = players.length;
+  if (n <= 1) return { complete: true, percent: 100, missingPairs: 0, totalPairs: 0 };
+
+  const totalPairs = (n * (n - 1)) / 2;
+  const seenPairs = new Set<string>();
+
+  for (const round of savedRounds) {
+    for (const m of round.matches) {
+      seenPairs.add(makeKey(m.teamA[0].id, m.teamA[1].id));
+      seenPairs.add(makeKey(m.teamB[0].id, m.teamB[1].id));
+    }
+  }
+
+  const done = seenPairs.size;
+  const percent = Math.max(0, Math.min(100, Math.round((done / totalPairs) * 100)));
+  const missingPairs = Math.max(0, totalPairs - done);
+  return { complete: done >= totalPairs, percent, missingPairs, totalPairs };
+}
+
+// Recommended rounds lower bound for partner coverage with court capacity
+function recommendRoundsPartner(playerCount: number, courts: number) {
+  if (playerCount < 4) return 0;
+  const c = Math.max(1, Math.min(courts, Math.floor(playerCount / 4) || 1));
+  // ceil( n*(n-1) / (4*c) )
+  const num = playerCount * (playerCount - 1);
+  const den = 4 * c;
+  return Math.max(1, Math.ceil(num / den));
+}
+
+// --- Fair round generator (partner-first) ---
 function computeStats(players: Player[], savedRounds: SavedRound[]) {
   const gamesPlayed: Record<string, number> = {};
   const partnerCount: Record<string, number> = {};
@@ -97,46 +133,7 @@ function computeStats(players: Player[], savedRounds: SavedRound[]) {
   return { gamesPlayed, partnerCount, opponentCount };
 }
 
-// --- Partner-Coverage helper ---
-function partnerCoverage(players: Player[], savedRounds: SavedRound[]) {
-  const n = players.length;
-  if (n <= 1) return { complete: true, percent: 100, missingPairs: 0, totalPairs: 0 };
-
-  const totalPairs = (n * (n - 1)) / 2;
-  const seenPairs = new Set<string>();
-
-  for (const round of savedRounds) {
-    for (const m of round.matches) {
-      const a = makeKey(m.teamA[0].id, m.teamA[1].id);
-      const b = makeKey(m.teamB[0].id, m.teamB[1].id);
-      seenPairs.add(a);
-      seenPairs.add(b);
-    }
-  }
-
-  const done = seenPairs.size;
-  const percent = Math.max(0, Math.min(100, Math.round((done / totalPairs) * 100)));
-  const missingPairs = Math.max(0, totalPairs - done);
-  return { complete: done >= totalPairs, percent, missingPairs, totalPairs };
-}
-
-// --- Recommended rounds for partner coverage (fair even with bench) ---
-// Lower bound to see all unique partnerships, given courts limit and rotations.
-function recommendRoundsPartner(playerCount: number, courts: number) {
-  if (playerCount < 4) return 0;
-  const c = Math.max(1, Math.min(courts, Math.floor(playerCount / 4) || 1));
-  // ceil( n*(n-1) / (4*c) )
-  const num = playerCount * (playerCount - 1);
-  const den = 4 * c;
-  return Math.max(1, Math.ceil(num / den));
-}
-
-// --- Fair round generator (uses partner/opponent penalties) ---
-function generateFairRound(params: {
-  players: Player[];
-  courtsWanted: number;
-  savedRounds: SavedRound[];
-}) {
+function generateFairRound(params: { players: Player[]; courtsWanted: number; savedRounds: SavedRound[] }) {
   const { players, courtsWanted, savedRounds } = params;
 
   const n = players.length;
@@ -146,11 +143,9 @@ function generateFairRound(params: {
 
   const { gamesPlayed, partnerCount, opponentCount } = computeStats(players, savedRounds);
 
-  // Bias to let low-games players play first (bench rotation fairness)
+  // Let low-games players play first (bench rotation fairness)
   const shuffled = [...players].sort(() => Math.random() - 0.5);
-  const byGames = shuffled.sort(
-    (a, b) => (gamesPlayed[a.id] ?? 0) - (gamesPlayed[b.id] ?? 0)
-  );
+  const byGames = shuffled.sort((a, b) => (gamesPlayed[a.id] ?? 0) - (gamesPlayed[b.id] ?? 0));
 
   const active = byGames.slice(0, slots);
   const bench = byGames.slice(slots);
@@ -164,18 +159,11 @@ function generateFairRound(params: {
   function matchScore(a: Player, b: Player, c: Player, d: Player) {
     // Partner repeats hurt most (partner coverage goal)
     const partnerPenalty = 14 * partner(a.id, b.id) + 14 * partner(c.id, d.id);
-
-    // Opponent repeats mild penalty (still adds variety)
+    // Opponent repeats mild penalty
     const opponentPenalty =
-      3 *
-      (opp(a.id, c.id) +
-        opp(a.id, d.id) +
-        opp(b.id, c.id) +
-        opp(b.id, d.id));
-
-    // Small bonus to include low-games players sooner
+      3 * (opp(a.id, c.id) + opp(a.id, d.id) + opp(b.id, c.id) + opp(b.id, d.id));
+    // Small bonus for players with fewer games
     const playtimeBonus = -0.25 * (gp(a.id) + gp(b.id) + gp(c.id) + gp(d.id));
-
     return partnerPenalty + opponentPenalty + playtimeBonus;
   }
 
@@ -195,11 +183,7 @@ function generateFairRound(params: {
     if (remaining.length < 4) break;
 
     let best:
-      | {
-          group: [Player, Player, Player, Player];
-          split: ReturnType<typeof bestSplitForFour>;
-          score: number;
-        }
+      | { group: [Player, Player, Player, Player]; split: ReturnType<typeof bestSplitForFour>; score: number }
       | null = null;
 
     for (let i = 0; i < remaining.length; i++) {
@@ -211,9 +195,7 @@ function generateFairRound(params: {
             const r = remaining[k];
             const s = remaining[l];
             const split = bestSplitForFour(p, q, r, s);
-            if (!best || split.score < best.score) {
-              best = { group: [p, q, r, s], split, score: split.score };
-            }
+            if (!best || split.score < best.score) best = { group: [p, q, r, s], split, score: split.score };
           }
         }
       }
@@ -254,7 +236,6 @@ function buildFinalRankingText(params: {
       : `Runden: ${Math.min(savedRounds.length, targetRounds)}/${targetRounds}\n`;
 
   const rankingLines = totalRanking.map((r, i) => `${i + 1}. ${r.name} — ${r.points}`);
-
   return `${header}${meta}\n📊 Final Ranking\n${rankingLines.join("\n")}\n`;
 }
 
@@ -297,123 +278,229 @@ function buildFullReportText(params: {
           .join("\n");
 
   const rankingLines = totalRanking.map((r, i) => `${i + 1}. ${r.name} — ${r.points}`);
-
   return `${header}${meta}\n🗓️ Runden\n${roundsBlock}\n\n📊 Final Ranking\n${rankingLines.join("\n")}\n`;
 }
 
-export default function Home() {
-  // Setup/Wizard state
-  const [tournamentName, setTournamentName] = useState<string>("Mein Americano");
-  const [setupDone, setSetupDone] = useState<boolean>(false);
+function clampInt(v: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, Math.floor(v)));
+}
 
-  const [setupPlayerCount, setSetupPlayerCount] = useState<number>(8);
-  const [setupNames, setSetupNames] = useState<string[]>(
-    Array.from({ length: 8 }, () => "")
+function PageShell(props: {
+  title: string;
+  subtitle?: string;
+  children: React.ReactNode;
+  bottomBar?: React.ReactNode;
+  topRight?: React.ReactNode;
+}) {
+  return (
+    <main className="min-h-screen bg-gray-50 text-gray-900">
+      <div className="mx-auto max-w-3xl px-4 pb-28 pt-8">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <h1 className="text-2xl font-bold">{props.title}</h1>
+            {props.subtitle ? <p className="mt-1 text-sm text-gray-600">{props.subtitle}</p> : null}
+          </div>
+          {props.topRight}
+        </div>
+
+        <div className="mt-6">{props.children}</div>
+      </div>
+
+      {props.bottomBar ? (
+        <div className="fixed inset-x-0 bottom-0 z-50 border-t border-gray-200 bg-white/95 backdrop-blur">
+          <div className="mx-auto max-w-3xl px-4 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-3">
+            {props.bottomBar}
+          </div>
+        </div>
+      ) : null}
+    </main>
   );
-  const [setupCourts, setSetupCourts] = useState<number>(2);
-  const [targetRounds, setTargetRounds] = useState<number>(recommendRoundsPartner(8, 2));
+}
 
-  // Main app state
-  const [name, setName] = useState("");
+function Segmented(props: {
+  value: "play" | "ranking" | "history";
+  onChange: (v: "play" | "ranking" | "history") => void;
+}) {
+  const Btn = (p: { v: "play" | "ranking" | "history"; label: string }) => (
+    <button
+      onClick={() => props.onChange(p.v)}
+      className={[
+        "flex-1 rounded-xl px-3 py-2 text-sm font-semibold",
+        props.value === p.v ? "bg-black text-white" : "bg-gray-100 text-gray-800 hover:bg-gray-200",
+      ].join(" ")}
+    >
+      {p.label}
+    </button>
+  );
+
+  return (
+    <div className="grid grid-cols-3 gap-2">
+      <Btn v="play" label="Play" />
+      <Btn v="ranking" label="Ranking" />
+      <Btn v="history" label="History" />
+    </div>
+  );
+}
+
+function ScorePill(props: {
+  label: string;
+  value: number | "";
+  onChange: (newVal: number | "") => void;
+}) {
+  const v = props.value === "" ? 0 : Number(props.value);
+
+  const bump = (delta: number) => {
+    const next = Math.max(0, v + delta);
+    props.onChange(next);
+  };
+
+  return (
+    <div className="rounded-2xl bg-gray-50 p-3 ring-1 ring-gray-200">
+      <div className="text-xs font-semibold text-gray-600">{props.label}</div>
+
+      <div className="mt-2 flex items-center justify-between gap-3">
+        <button
+          onClick={() => bump(-1)}
+          className="h-11 w-11 rounded-xl bg-white text-lg font-bold ring-1 ring-gray-200 hover:bg-gray-100"
+        >
+          −
+        </button>
+
+        <div className="flex items-center gap-2">
+          <input
+            inputMode="numeric"
+            type="number"
+            min={0}
+            value={props.value}
+            onChange={(e) => props.onChange(e.target.value === "" ? "" : Math.max(0, Number(e.target.value)))}
+            className="w-20 rounded-xl border border-gray-300 bg-white px-3 py-2 text-center text-lg font-bold outline-none focus:border-gray-400"
+            placeholder="0"
+          />
+        </div>
+
+        <button
+          onClick={() => bump(+1)}
+          className="h-11 w-11 rounded-xl bg-white text-lg font-bold ring-1 ring-gray-200 hover:bg-gray-100"
+        >
+          +
+        </button>
+      </div>
+
+      <div className="mt-2 grid grid-cols-4 gap-2">
+        {[+5, +10, +15, 0].map((x) =>
+          x === 0 ? (
+            <button
+              key="reset"
+              onClick={() => props.onChange(0)}
+              className="rounded-xl bg-white px-2 py-2 text-xs font-semibold text-gray-800 ring-1 ring-gray-200 hover:bg-gray-100"
+            >
+              Reset
+            </button>
+          ) : (
+            <button
+              key={x}
+              onClick={() => bump(x)}
+              className="rounded-xl bg-white px-2 py-2 text-xs font-semibold text-gray-800 ring-1 ring-gray-200 hover:bg-gray-100"
+            >
+              +{x}
+            </button>
+          )
+        )}
+      </div>
+    </div>
+  );
+}
+
+export default function Home() {
+  // Setup
+  const [setupDone, setSetupDone] = useState(false);
+  const [tournamentName, setTournamentName] = useState("Mein Americano");
+  const [setupPlayerCount, setSetupPlayerCount] = useState(8);
+  const [setupNames, setSetupNames] = useState<string[]>(Array.from({ length: 8 }, () => ""));
+  const [setupCourts, setSetupCourts] = useState(2);
+  const [targetRounds, setTargetRounds] = useState(recommendRoundsPartner(8, 2));
+
+  // Tournament
   const [players, setPlayers] = useState<Player[]>([]);
-  const [courts, setCourts] = useState<number>(1);
+  const [courts, setCourts] = useState(1);
 
   const [matches, setMatches] = useState<Match[]>([]);
   const [results, setResults] = useState<Record<number, MatchResult>>({});
   const [savedRounds, setSavedRounds] = useState<SavedRound[]>([]);
-  const [manualEnded, setManualEnded] = useState<boolean>(false);
 
-  // NEW
-  const [extraMode, setExtraMode] = useState<boolean>(false);
+  const [manualEnded, setManualEnded] = useState(false);
+  const [extraMode, setExtraMode] = useState(false);
 
-  const [error, setError] = useState<string>("");
-  const [toast, setToast] = useState<string>("");
+  // UI
+  const [activeTab, setActiveTab] = useState<"play" | "ranking" | "history">("play");
+  const [toast, setToast] = useState("");
+  const [error, setError] = useState("");
+  const [loaded, setLoaded] = useState(false);
 
-  const [loadedFromStorage, setLoadedFromStorage] = useState(false);
-
-  // --- LOAD once on mount ---
+  // Load
   useEffect(() => {
-    // Backward compatibility: try old key too (if exists)
-    const legacy = safeParse<any>(localStorage.getItem("americano_app_state_v2"));
-    const parsed = safeParse<PersistedStateV3>(localStorage.getItem(STORAGE_KEY));
-
-    if (parsed && parsed.version === 3) {
+    const parsed = safeParse<PersistedStateV4>(localStorage.getItem(STORAGE_KEY));
+    if (parsed && parsed.version === 4) {
       setTournamentName(parsed.tournamentName ?? "Mein Americano");
       setSetupDone(parsed.setupDone ?? false);
-      setTargetRounds(parsed.targetRounds ?? 0);
-
-      setExtraMode(parsed.extraMode ?? false);
-
-      setManualEnded(parsed.manualEnded ?? false);
 
       setPlayers(parsed.players ?? []);
       setCourts(parsed.courts ?? 1);
+      setTargetRounds(parsed.targetRounds ?? 0);
+
+      setManualEnded(parsed.manualEnded ?? false);
+      setExtraMode(parsed.extraMode ?? false);
 
       setMatches(parsed.matches ?? []);
       setResults(parsed.results ?? {});
       setSavedRounds(parsed.savedRounds ?? []);
-    } else if (legacy && legacy.version === 2) {
-      // Migrate v2 -> v3
-      setTournamentName(legacy.tournamentName ?? "Mein Americano");
-      setSetupDone(legacy.setupDone ?? false);
-      setTargetRounds(legacy.targetRounds ?? 0);
 
-      setExtraMode(false);
-
-      setManualEnded(legacy.manualEnded ?? false);
-
-      setPlayers(legacy.players ?? []);
-      setCourts(legacy.courts ?? 1);
-
-      setMatches(legacy.matches ?? []);
-      setResults(legacy.results ?? {});
-      setSavedRounds(legacy.savedRounds ?? []);
-
-      localStorage.removeItem("americano_app_state_v2");
+      setActiveTab(parsed.activeTab ?? "play");
     }
-
-    setLoadedFromStorage(true);
+    setLoaded(true);
   }, []);
 
-  // --- SAVE whenever state changes ---
+  // Save
   useEffect(() => {
-    if (!loadedFromStorage) return;
-    const payload: PersistedStateV3 = {
-      version: 3,
+    if (!loaded) return;
+    const payload: PersistedStateV4 = {
+      version: 4,
       tournamentName,
       setupDone,
-      targetRounds,
-      extraMode,
-      manualEnded,
       players,
       courts,
+      targetRounds,
+      manualEnded,
+      extraMode,
       matches,
       results,
       savedRounds,
+      activeTab,
     };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
   }, [
-    loadedFromStorage,
+    loaded,
     tournamentName,
     setupDone,
-    targetRounds,
-    extraMode,
-    manualEnded,
     players,
     courts,
+    targetRounds,
+    manualEnded,
+    extraMode,
     matches,
     results,
     savedRounds,
+    activeTab,
   ]);
 
-  // Toast auto-hide
+  // Toast
   useEffect(() => {
     if (!toast) return;
     const t = setTimeout(() => setToast(""), 2200);
     return () => clearTimeout(t);
   }, [toast]);
 
-  // Keep setup fields consistent when player count changes
+  // Setup names array size
   useEffect(() => {
     setSetupNames((prev) => {
       const next = [...prev];
@@ -426,15 +513,12 @@ export default function Home() {
     });
   }, [setupPlayerCount]);
 
-  // Update recommended rounds when player count or courts change
+  // Update recommended rounds when player count/courts change
   useEffect(() => {
-    const rec = recommendRoundsPartner(setupPlayerCount, setupCourts);
+    const possibleCourtsSetup = Math.max(1, Math.floor(setupPlayerCount / 4));
+    const fixedCourts = clampInt(setupCourts, 1, possibleCourtsSetup);
+    const rec = recommendRoundsPartner(setupPlayerCount, fixedCourts);
     setTargetRounds((curr) => {
-      // If user never touched rounds much, keep it aligned
-      // but if they changed it significantly, don't fight them.
-      // Simple rule: if curr equals previous recommendation (roughly),
-      // update it; otherwise keep their value.
-      // We'll just update if curr is 0 or curr is close to rec (±1).
       if (curr <= 0) return rec;
       if (Math.abs(curr - rec) <= 1) return rec;
       return curr;
@@ -450,70 +534,140 @@ export default function Home() {
   const tournamentFinished =
     manualEnded || (!extraMode && targetRounds > 0 && savedRounds.length >= targetRounds);
 
-  const sortedPlayers = useMemo(() => {
-    return [...players].sort((a, b) => a.name.localeCompare(b.name, "de"));
-  }, [players]);
+  const roundsProgress =
+    targetRounds > 0 ? `${Math.min(savedRounds.length, targetRounds)}/${targetRounds}` : `${savedRounds.length}`;
+
+  const sortedPlayers = useMemo(() => [...players].sort((a, b) => a.name.localeCompare(b.name, "de")), [players]);
+
+  const unusedPlayers = useMemo(() => {
+    const usedIds = new Set<string>();
+    matches.forEach((m) => {
+      m.teamA.forEach((p) => usedIds.add(p.id));
+      m.teamB.forEach((p) => usedIds.add(p.id));
+    });
+    return sortedPlayers.filter((p) => !usedIds.has(p.id));
+  }, [matches, sortedPlayers]);
+
+  const totalRanking = useMemo(() => {
+    const points: Record<string, number> = {};
+    players.forEach((p) => (points[p.id] = 0));
+
+    savedRounds.forEach((round) => {
+      round.matches.forEach((m) => {
+        const r = round.results[m.court];
+        m.teamA.forEach((p) => (points[p.id] += r.scoreA));
+        m.teamB.forEach((p) => (points[p.id] += r.scoreB));
+      });
+    });
+
+    const rows = players.map((p) => ({ id: p.id, name: p.name, points: points[p.id] ?? 0 }));
+    rows.sort((x, y) => y.points - x.points || x.name.localeCompare(y.name, "de"));
+    return rows;
+  }, [players, savedRounds]);
+
+  const currentRoundRanking = useMemo(() => {
+    const points: Record<string, number> = {};
+    players.forEach((p) => (points[p.id] = 0));
+
+    matches.forEach((m) => {
+      const r = results[m.court];
+      if (!r || r.scoreA === "" || r.scoreB === "") return;
+      m.teamA.forEach((p) => (points[p.id] += Number(r.scoreA)));
+      m.teamB.forEach((p) => (points[p.id] += Number(r.scoreB)));
+    });
+
+    const rows = players.map((p) => ({ id: p.id, name: p.name, points: points[p.id] ?? 0 }));
+    rows.sort((x, y) => y.points - x.points || x.name.localeCompare(y.name, "de"));
+    return rows;
+  }, [players, matches, results]);
+
+  const canSaveCurrentRound = useMemo(() => {
+    if (matches.length === 0) return false;
+    return matches.every((m) => {
+      const r = results[m.court];
+      return r && r.scoreA !== "" && r.scoreB !== "";
+    });
+  }, [matches, results]);
+
+  async function copyToClipboard(text: string, okMessage: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      setToast(okMessage);
+    } catch {
+      setError("Kopieren hat nicht funktioniert. Bitte Clipboard erlauben.");
+    }
+  }
 
   function resetAll() {
-    setTournamentName("Mein Americano");
+    localStorage.removeItem(STORAGE_KEY);
+
     setSetupDone(false);
-    setTargetRounds(0);
-    setManualEnded(false);
-    setExtraMode(false);
+    setTournamentName("Mein Americano");
+
+    setSetupPlayerCount(8);
+    setSetupNames(Array.from({ length: 8 }, () => ""));
+    setSetupCourts(2);
+    setTargetRounds(recommendRoundsPartner(8, 2));
 
     setPlayers([]);
     setCourts(1);
-    setMatches([]);
-    setResults({});
-    setSavedRounds([]);
-    setName("");
-    setError("");
-    setToast("");
-    localStorage.removeItem(STORAGE_KEY);
-  }
 
-  function newTournamentFromCurrent() {
-    setError("");
-    setSetupPlayerCount(Math.max(4, players.length || 8));
-    setSetupNames(players.length > 0 ? players.map((p) => p.name) : Array.from({ length: 8 }, () => ""));
-    setSetupCourts(courts || 1);
-    setTargetRounds(recommendRoundsPartner(Math.max(4, players.length || 8), courts || 1));
-    setSavedRounds([]);
     setMatches([]);
     setResults({});
+    setSavedRounds([]);
+
     setManualEnded(false);
     setExtraMode(false);
-    setSetupDone(false);
-  }
 
-  // Players editing (after setup)
-  const canAdd = name.trim().length >= 2;
-
-  function addPlayer() {
-    const trimmed = name.trim();
-    if (trimmed.length < 2) return;
-    setPlayers((prev) => [...prev, { id: crypto.randomUUID(), name: trimmed }]);
-    setName("");
+    setActiveTab("play");
+    setToast("");
     setError("");
   }
 
-  function removePlayer(id: string) {
-    setPlayers((prev) => prev.filter((p) => p.id !== id));
+  function startTournamentFromSetup() {
     setError("");
+
+    const tName = tournamentName.trim();
+    const names = setupNames.map((n) => n.trim());
+
+    if (tName.length < 2) return setError("Bitte einen Turniernamen eingeben.");
+    if (setupPlayerCount < 4) return setError("Mindestens 4 Spieler:innen.");
+
+    if (names.some((n) => n.length === 0)) {
+      return setError("Bitte alle Namen eintragen (oder Auto-Fill nutzen).");
+    }
+
+    const newPlayers: Player[] = names.map((n) => ({ id: crypto.randomUUID(), name: n }));
+    const maxPossible = Math.max(1, Math.floor(newPlayers.length / 4));
+    const fixedCourts = clampInt(setupCourts, 1, maxPossible);
+
+    setPlayers(newPlayers);
+    setCourts(fixedCourts);
+
+    const rec = recommendRoundsPartner(newPlayers.length, fixedCourts);
+    setTargetRounds(targetRounds || rec);
+
+    setMatches([]);
+    setResults({});
+    setSavedRounds([]);
+
+    setManualEnded(false);
+    setExtraMode(false);
+
+    setSetupDone(true);
+    setActiveTab("play");
   }
 
   function generateRoundFair() {
     setError("");
 
     if (tournamentFinished) {
-      setError("Turnier ist beendet. Tippe auf „Extra-Runden spielen“ oder starte ein neues Turnier.");
+      setError("Turnier beendet. Tippe auf „Extra-Runden spielen“ oder starte ein neues Turnier.");
       return;
     }
 
     if (players.length < 4) {
-      setMatches([]);
-      setResults({});
-      setError("Du brauchst mindestens 4 Spieler für ein Match (2v2).");
+      setError("Mindestens 4 Spieler:innen nötig.");
       return;
     }
 
@@ -527,54 +681,33 @@ export default function Home() {
     });
 
     const newResults: Record<number, MatchResult> = {};
-    for (const m of fairMatches) newResults[m.court] = { scoreA: "", scoreB: "" };
+    for (const m of fairMatches) newResults[m.court] = { scoreA: 0, scoreB: 0 };
 
     setMatches(fairMatches);
     setResults(newResults);
+    setActiveTab("play");
   }
 
-  const unusedPlayers = useMemo(() => {
-    const usedIds = new Set<string>();
-    matches.forEach((m) => {
-      m.teamA.forEach((p) => usedIds.add(p.id));
-      m.teamB.forEach((p) => usedIds.add(p.id));
-    });
-    return sortedPlayers.filter((p) => !usedIds.has(p.id));
-  }, [matches, sortedPlayers]);
-
-  function updateScore(court: number, side: "A" | "B", value: string) {
-    const num = value === "" ? "" : Math.max(0, Number(value));
+  function updateScore(court: number, side: "A" | "B", newVal: number | "") {
     setResults((prev) => ({
       ...prev,
       [court]: {
-        scoreA: side === "A" ? num : prev[court]?.scoreA ?? "",
-        scoreB: side === "B" ? num : prev[court]?.scoreB ?? "",
+        scoreA: side === "A" ? newVal : prev[court]?.scoreA ?? 0,
+        scoreB: side === "B" ? newVal : prev[court]?.scoreB ?? 0,
       },
     }));
-  }
-
-  function canSaveCurrentRound() {
-    if (matches.length === 0) return false;
-    return matches.every((m) => {
-      const r = results[m.court];
-      return r && r.scoreA !== "" && r.scoreB !== "";
-    });
   }
 
   function saveRound() {
     setError("");
 
     if (tournamentFinished) {
-      setError("Turnier ist beendet. Tippe auf „Extra-Runden spielen“ oder starte ein neues Turnier.");
+      setError("Turnier beendet. Tippe auf „Extra-Runden spielen“ oder starte ein neues Turnier.");
       return;
     }
 
-    if (matches.length === 0) {
-      setError("Erst eine Runde generieren, dann speichern.");
-      return;
-    }
-    if (!canSaveCurrentRound()) {
-      setError("Bitte für alle Courts beide Punktzahlen eintragen, bevor du speicherst.");
+    if (!canSaveCurrentRound) {
+      setError("Bitte alle Scores eintragen.");
       return;
     }
 
@@ -595,212 +728,104 @@ export default function Home() {
     setSavedRounds((prev) => [round, ...prev]);
     setMatches([]);
     setResults({});
+    setToast("Runde gespeichert ✅");
   }
 
   function deleteLastRound() {
     setSavedRounds((prev) => prev.slice(1));
+    setToast("Letzte Runde gelöscht ✅");
   }
 
   function endTournamentNow() {
-    setError("");
     setManualEnded(true);
     setMatches([]);
     setResults({});
-  }
-
-  function resumeTournament() {
-    setError("");
-    setManualEnded(false);
+    setActiveTab("ranking");
   }
 
   function playExtraRounds() {
-    setError("");
     setManualEnded(false);
     setExtraMode(true);
+    setActiveTab("play");
+    setToast("Extra-Modus aktiviert ✅");
   }
 
-  const totalRanking = useMemo(() => {
-    const points: Record<string, number> = {};
-    players.forEach((p) => (points[p.id] = 0));
-
-    savedRounds.forEach((round) => {
-      round.matches.forEach((m) => {
-        const r = round.results[m.court];
-        const a = r.scoreA;
-        const b = r.scoreB;
-        m.teamA.forEach((p) => (points[p.id] += a));
-        m.teamB.forEach((p) => (points[p.id] += b));
-      });
-    });
-
-    const rows = players.map((p) => ({
-      id: p.id,
-      name: p.name,
-      points: points[p.id] ?? 0,
-    }));
-
-    rows.sort((x, y) => y.points - x.points || x.name.localeCompare(y.name, "de"));
-    return rows;
-  }, [players, savedRounds]);
-
-  const currentRoundRanking = useMemo(() => {
-    const points: Record<string, number> = {};
-    players.forEach((p) => (points[p.id] = 0));
-
-    matches.forEach((m) => {
-      const r = results[m.court];
-      if (!r || r.scoreA === "" || r.scoreB === "") return;
-      const a = Number(r.scoreA);
-      const b = Number(r.scoreB);
-      m.teamA.forEach((p) => (points[p.id] += a));
-      m.teamB.forEach((p) => (points[p.id] += b));
-    });
-
-    const rows = players.map((p) => ({
-      id: p.id,
-      name: p.name,
-      points: points[p.id] ?? 0,
-    }));
-
-    rows.sort((x, y) => y.points - x.points || x.name.localeCompare(y.name, "de"));
-    return rows;
-  }, [matches, players, results]);
-
-  const anyCurrentResultEntered = useMemo(() => {
-    return matches.some((m) => {
-      const r = results[m.court];
-      return r && (r.scoreA !== "" || r.scoreB !== "");
-    });
-  }, [matches, results]);
-
-  const roundsProgress = targetRounds > 0 ? `${Math.min(savedRounds.length, targetRounds)}/${targetRounds}` : `${savedRounds.length}`;
-
-  async function copyToClipboard(text: string, okMessage: string) {
-    try {
-      await navigator.clipboard.writeText(text);
-      setToast(okMessage);
-    } catch {
-      setError("Kopieren hat nicht funktioniert (Clipboard). Bitte im Browser erlauben.");
-    }
-  }
-
-  function startTournamentFromSetup() {
-    setError("");
-
-    const tName = tournamentName.trim();
-    const names = setupNames.map((n) => n.trim());
-
-    if (tName.length < 2) {
-      setError("Bitte einen Turniernamen eingeben.");
-      return;
-    }
-
-    // Allow empty fields BUT then they must use Auto-Fill or fill manually
-    if (names.some((n) => n.length === 0)) {
-      setError("Bitte für alle Spieler:innen einen Namen eintragen (oder Auto-Fill nutzen).");
-      return;
-    }
-
-    if (setupCourts < 1) {
-      setError("Bitte mindestens 1 Court auswählen.");
-      return;
-    }
-
-    const newPlayers: Player[] = names.map((n) => ({ id: crypto.randomUUID(), name: n }));
-    const maxPossible = Math.max(1, Math.floor(newPlayers.length / 4));
-    const fixedCourts = Math.min(setupCourts, maxPossible);
-
-    setPlayers(newPlayers);
-    setCourts(fixedCourts);
-    setSavedRounds([]);
-    setMatches([]);
-    setResults({});
-    setTargetRounds(targetRounds || recommendRoundsPartner(setupPlayerCount, fixedCourts));
-    setManualEnded(false);
-    setExtraMode(false);
-    setSetupDone(true);
-  }
-
-  // --- UI: Setup Wizard ---
+  // ------------- SETUP SCREEN -------------
   if (!setupDone) {
     const possibleCourtsSetup = Math.max(1, Math.floor(setupPlayerCount / 4));
-    const recommended = recommendRoundsPartner(setupPlayerCount, Math.min(setupCourts, possibleCourtsSetup));
+    const fixedCourts = clampInt(setupCourts, 1, possibleCourtsSetup);
+    const rec = recommendRoundsPartner(setupPlayerCount, fixedCourts);
 
     return (
-      <main className="min-h-screen bg-gray-50 text-gray-900">
-        <div className="mx-auto max-w-3xl px-4 py-10">
-          <div className="flex items-end justify-between">
-            <div>
-              <h1 className="text-3xl font-bold">Americano Organizer</h1>
-              <p className="mt-2 text-gray-600">
-                Setup: Turniername → Spieler:innen → Courts → Runden.
-              </p>
-            </div>
-            <button
-              onClick={resetAll}
-              className="rounded-xl border border-gray-200 bg-white px-4 py-2 text-sm font-medium text-gray-800 shadow-sm hover:bg-gray-50"
-            >
-              Reset
-            </button>
+      <PageShell
+        title="Americano Organizer"
+        subtitle="Setup → Start → Spielen"
+        topRight={
+          <button
+            onClick={resetAll}
+            className="rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm font-semibold shadow-sm hover:bg-gray-50"
+          >
+            Reset
+          </button>
+        }
+      >
+        {error ? (
+          <div className="mb-4 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800">
+            {error}
           </div>
+        ) : null}
 
-          {error && (
-            <div className="mt-6 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800">
-              {error}
-            </div>
-          )}
-
-          <section className="mt-8 rounded-2xl bg-white p-5 shadow-sm ring-1 ring-gray-200">
-            <h2 className="text-lg font-semibold">1) Turnier</h2>
-            <label className="mt-3 block text-sm text-gray-700">
-              Turniername
-              <input
-                value={tournamentName}
-                onChange={(e) => setTournamentName(e.target.value)}
-                className="mt-1 w-full rounded-xl border border-gray-300 bg-white px-3 py-2 outline-none focus:border-gray-400"
-                placeholder="z.B. Padel Americano Freitag"
-              />
-            </label>
+        <div className="space-y-5">
+          <section className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-gray-200">
+            <div className="text-sm font-semibold text-gray-800">Turniername</div>
+            <input
+              value={tournamentName}
+              onChange={(e) => setTournamentName(e.target.value)}
+              className="mt-2 w-full rounded-xl border border-gray-300 bg-white px-3 py-3 text-base outline-none focus:border-gray-400"
+              placeholder="z.B. Padel Americano Freitag"
+            />
           </section>
 
-          <section className="mt-6 rounded-2xl bg-white p-5 shadow-sm ring-1 ring-gray-200">
+          <section className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-gray-200">
             <div className="flex items-center justify-between gap-3">
-              <h2 className="text-lg font-semibold">2) Spieler:innen</h2>
-
-              <div className="flex flex-wrap gap-2">
+              <div>
+                <div className="text-sm font-semibold text-gray-800">Spieler:innen</div>
+                <div className="mt-1 text-xs text-gray-600">Leere Felder, Auto-Fill, Easy Mobile Edit.</div>
+              </div>
+              <div className="flex gap-2">
                 <button
                   onClick={() =>
                     setSetupNames((prev) =>
                       prev.map((v, i) => (v.trim().length === 0 ? `Spieler ${i + 1}` : v))
                     )
                   }
-                  className="rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm font-medium text-gray-800 shadow-sm hover:bg-gray-50"
+                  className="rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm font-semibold shadow-sm hover:bg-gray-50"
                 >
                   Auto-Fill
                 </button>
                 <button
                   onClick={() => setSetupNames((prev) => prev.map(() => ""))}
-                  className="rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm font-medium text-gray-800 shadow-sm hover:bg-gray-50"
+                  className="rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm font-semibold shadow-sm hover:bg-gray-50"
                 >
-                  Alle leeren
+                  Leeren
                 </button>
               </div>
             </div>
 
-            <label className="mt-3 block text-sm text-gray-700">
-              Anzahl Spieler:innen
+            <div className="mt-4">
+              <label className="text-sm font-semibold text-gray-700">Anzahl</label>
               <input
                 type="number"
                 min={4}
                 value={setupPlayerCount}
                 onChange={(e) => setSetupPlayerCount(Math.max(4, Number(e.target.value)))}
-                className="mt-1 w-full rounded-xl border border-gray-300 bg-white px-3 py-2 outline-none focus:border-gray-400"
+                className="mt-2 w-full rounded-xl border border-gray-300 bg-white px-3 py-3 text-base outline-none focus:border-gray-400"
               />
-            </label>
+            </div>
 
             <div className="mt-4 grid gap-3 sm:grid-cols-2">
               {setupNames.map((val, idx) => (
-                <label key={idx} className="text-sm text-gray-700">
+                <label key={idx} className="text-sm font-semibold text-gray-700">
                   Spieler {idx + 1}
                   <input
                     value={val}
@@ -813,574 +838,421 @@ export default function Home() {
                         return next;
                       });
                     }}
-                    className="mt-1 w-full rounded-xl border border-gray-300 bg-white px-3 py-2 outline-none focus:border-gray-400"
+                    className="mt-2 w-full rounded-xl border border-gray-300 bg-white px-3 py-3 text-base outline-none focus:border-gray-400"
                     placeholder={`Name ${idx + 1}`}
                   />
                 </label>
               ))}
             </div>
-
-            <div className="mt-4 rounded-xl bg-gray-50 p-4 text-sm text-gray-700">
-              <div className="font-semibold">Hinweis</div>
-              Pro Court brauchst du <span className="font-semibold">4 Spieler</span> (2v2).
-            </div>
           </section>
 
-          <section className="mt-6 rounded-2xl bg-white p-5 shadow-sm ring-1 ring-gray-200">
-            <h2 className="text-lg font-semibold">3) Courts & Runden</h2>
+          <section className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-gray-200">
+            <div className="text-sm font-semibold text-gray-800">Courts & Runden</div>
 
-            <label className="mt-3 block text-sm text-gray-700">
-              Anzahl Courts (max. {possibleCourtsSetup})
-              <input
-                type="number"
-                min={1}
-                max={possibleCourtsSetup}
-                value={setupCourts}
-                onChange={(e) =>
-                  setSetupCourts(Math.min(possibleCourtsSetup, Math.max(1, Number(e.target.value))))
-                }
-                className="mt-1 w-full rounded-xl border border-gray-300 bg-white px-3 py-2 outline-none focus:border-gray-400"
-              />
-            </label>
+            <div className="mt-4 grid gap-4 sm:grid-cols-2">
+              <div>
+                <label className="text-sm font-semibold text-gray-700">Courts (max. {possibleCourtsSetup})</label>
+                <input
+                  type="number"
+                  min={1}
+                  max={possibleCourtsSetup}
+                  value={setupCourts}
+                  onChange={(e) => setSetupCourts(clampInt(Number(e.target.value), 1, possibleCourtsSetup))}
+                  className="mt-2 w-full rounded-xl border border-gray-300 bg-white px-3 py-3 text-base outline-none focus:border-gray-400"
+                />
+              </div>
+              <div>
+                <label className="text-sm font-semibold text-gray-700">Runden (Vorschlag: {rec})</label>
+                <input
+                  type="number"
+                  min={1}
+                  value={targetRounds}
+                  onChange={(e) => setTargetRounds(Math.max(1, Number(e.target.value)))}
+                  className="mt-2 w-full rounded-xl border border-gray-300 bg-white px-3 py-3 text-base outline-none focus:border-gray-400"
+                />
+              </div>
+            </div>
 
-            <label className="mt-4 block text-sm text-gray-700">
-              Runden (Vorschlag: {recommended})
-              <input
-                type="number"
-                min={1}
-                value={targetRounds}
-                onChange={(e) => setTargetRounds(Math.max(1, Number(e.target.value)))}
-                className="mt-1 w-full rounded-xl border border-gray-300 bg-white px-3 py-2 outline-none focus:border-gray-400"
-              />
-            </label>
-
-            <div className="mt-4 rounded-xl bg-gray-50 p-4 text-sm text-gray-700">
-              <div className="font-semibold">Partner-Coverage (Padel)</div>
-              <p className="mt-1">
-                Ziel: möglichst jede Paarung (Partner) mindestens einmal.
-                Der Vorschlag berücksichtigt Courts + Rotation (Pausen).
-              </p>
+            <div className="mt-4 rounded-2xl bg-gray-50 p-4 text-sm text-gray-700 ring-1 ring-gray-200">
+              <div className="font-semibold">Padel-Logik: Partner-Coverage</div>
+              <div className="mt-1">
+                Ziel: möglichst jede Paarung (Partner) mindestens einmal. Runden-Vorschlag ist ein fairer Richtwert.
+              </div>
             </div>
 
             <button
               onClick={startTournamentFromSetup}
-              className="mt-5 w-full rounded-xl bg-black px-4 py-3 font-medium text-white shadow-sm hover:opacity-95"
+              className="mt-5 w-full rounded-2xl bg-black px-4 py-4 text-base font-semibold text-white shadow-sm hover:opacity-95"
             >
               Turnier starten
             </button>
           </section>
         </div>
-      </main>
+      </PageShell>
     );
   }
 
-  // --- MAIN APP UI ---
-  return (
-    <main className="min-h-screen bg-gray-50 text-gray-900">
-      <div className="mx-auto max-w-5xl px-4 py-10">
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
-          <div>
-            <h1 className="text-3xl font-bold">{tournamentName}</h1>
-            <p className="mt-2 text-gray-600">
-              Fortschritt: <span className="font-semibold">{roundsProgress}</span> · Courts:{" "}
-              <span className="font-semibold">{effectiveCourts}</span> · Partner-Coverage:{" "}
-              <span className="font-semibold">{coverage.percent}%</span>
-              {extraMode ? <span className="ml-2 rounded-full bg-gray-100 px-2 py-1 text-xs">Extra</span> : null}
-            </p>
-          </div>
+  // ------------- APP SHELL (Play/Ranking/History) -------------
 
+  const headerSubtitle = `Runde ${roundsProgress} • Courts ${effectiveCourts} • Partner ${coverage.percent}%${
+    extraMode ? " • Extra" : ""
+  }`;
+
+  const bottomBar = (
+    <div className="space-y-3">
+      {toast ? (
+        <div className="rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm font-semibold text-emerald-900">
+          {toast}
+        </div>
+      ) : null}
+
+      {error ? (
+        <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-semibold text-red-800">
+          {error}
+        </div>
+      ) : null}
+
+      {/* App-like segmented nav */}
+      <Segmented value={activeTab} onChange={setActiveTab} />
+
+      {/* Primary actions for Play screen */}
+      {activeTab === "play" ? (
+        <div className="grid grid-cols-2 gap-2">
           <button
-            onClick={resetAll}
-            className="w-fit rounded-xl border border-gray-200 bg-white px-4 py-2 text-sm font-medium text-gray-800 shadow-sm hover:bg-gray-50"
+            onClick={generateRoundFair}
+            disabled={tournamentFinished}
+            className="rounded-2xl bg-emerald-600 px-4 py-4 text-base font-bold text-white shadow-sm hover:bg-emerald-700 disabled:opacity-40"
           >
-            Reset (alles löschen)
+            Neue Runde
+          </button>
+          <button
+            onClick={saveRound}
+            disabled={tournamentFinished || !canSaveCurrentRound}
+            className="rounded-2xl bg-black px-4 py-4 text-base font-bold text-white shadow-sm hover:opacity-95 disabled:opacity-40"
+          >
+            Speichern
           </button>
         </div>
+      ) : null}
+    </div>
+  );
 
-        {toast && (
-          <div className="mt-6 rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
-            {toast}
+  const topRight = (
+    <button
+      onClick={resetAll}
+      className="rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm font-semibold shadow-sm hover:bg-gray-50"
+    >
+      Reset
+    </button>
+  );
+
+  // Turnier finished banner (shown on all tabs)
+  const finishedBanner = tournamentFinished ? (
+    <div className="mb-4 rounded-2xl bg-white p-4 shadow-sm ring-1 ring-gray-200">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <div className="text-base font-bold">🏁 Turnier beendet</div>
+          <div className="mt-1 text-sm text-gray-600">
+            {manualEnded
+              ? `Manuell beendet • Runden: ${savedRounds.length}`
+              : `Zielrunden erreicht: ${targetRounds} • Partner: ${coverage.percent}%`}
           </div>
-        )}
-
-        {/* Turnier beendet */}
-        {tournamentFinished && (
-          <div className="mt-6 rounded-2xl bg-white p-5 shadow-sm ring-1 ring-gray-200">
-            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-              <div>
-                <div className="text-lg font-semibold">🏁 Turnier beendet</div>
-                <div className="mt-1 text-sm text-gray-600">
-                  {manualEnded ? (
-                    <>
-                      Turnier wurde manuell beendet. Gespeichert:{" "}
-                      <span className="font-semibold">{savedRounds.length}</span> Runde(n).
-                    </>
-                  ) : (
-                    <>
-                      Zielrunden erreicht: <span className="font-semibold">{targetRounds}</span>. Partner-Coverage:{" "}
-                      <span className="font-semibold">{coverage.percent}%</span>.
-                    </>
-                  )}
-                </div>
-              </div>
-              <div className="flex flex-wrap gap-2">
-                <button
-                  onClick={playExtraRounds}
-                  className="rounded-xl bg-black px-4 py-2 text-sm font-medium text-white shadow-sm hover:opacity-95"
-                >
-                  Extra-Runden spielen
-                </button>
-
-                {manualEnded && savedRounds.length < targetRounds && (
-                  <button
-                    onClick={resumeTournament}
-                    className="rounded-xl border border-gray-200 bg-white px-4 py-2 text-sm font-medium text-gray-800 shadow-sm hover:bg-gray-50"
-                  >
-                    Weiter spielen
-                  </button>
-                )}
-
-                <button
-                  onClick={() =>
-                    copyToClipboard(
-                      buildFinalRankingText({
-                        tournamentName,
-                        savedRounds,
-                        totalRanking: totalRanking.map((r) => ({ name: r.name, points: r.points })),
-                        targetRounds,
-                        manualEnded,
-                        extraMode,
-                      }),
-                      "Final Ranking kopiert ✅"
-                    )
-                  }
-                  className="rounded-xl border border-gray-200 bg-white px-4 py-2 text-sm font-medium text-gray-800 shadow-sm hover:bg-gray-50"
-                >
-                  Copy Final
-                </button>
-
-                <button
-                  onClick={() =>
-                    copyToClipboard(
-                      buildFullReportText({
-                        tournamentName,
-                        savedRounds,
-                        totalRanking: totalRanking.map((r) => ({ name: r.name, points: r.points })),
-                        targetRounds,
-                        manualEnded,
-                        extraMode,
-                      }),
-                      "Turnier-Report kopiert ✅"
-                    )
-                  }
-                  className="rounded-xl border border-gray-200 bg-white px-4 py-2 text-sm font-medium text-gray-800 shadow-sm hover:bg-gray-50"
-                >
-                  Copy Report
-                </button>
-
-                <button
-                  onClick={newTournamentFromCurrent}
-                  className="rounded-xl border border-gray-200 bg-white px-4 py-2 text-sm font-medium text-gray-800 shadow-sm hover:bg-gray-50"
-                >
-                  Neues Turnier
-                </button>
-              </div>
-            </div>
-
-            <div className="mt-4 overflow-hidden rounded-xl border border-gray-100">
-              <table className="w-full text-left text-sm">
-                <thead className="bg-gray-50 text-gray-700">
-                  <tr>
-                    <th className="px-4 py-3 font-semibold">#</th>
-                    <th className="px-4 py-3 font-semibold">Spieler</th>
-                    <th className="px-4 py-3 font-semibold">Punkte</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-gray-100">
-                  {totalRanking.map((row, idx) => (
-                    <tr key={row.id} className="bg-white">
-                      <td className="px-4 py-3 font-medium text-gray-700">{idx + 1}</td>
-                      <td className="px-4 py-3 font-medium">{row.name}</td>
-                      <td className="px-4 py-3 font-semibold">{row.points}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        )}
-
-        {error && (
-          <div className="mt-6 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800">
-            {error}
-          </div>
-        )}
-
-        <div className="mt-8 grid gap-6 lg:grid-cols-2">
-          {/* Players Card */}
-          <section className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-gray-200">
-            <div className="flex items-center justify-between">
-              <h2 className="text-lg font-semibold">Spieler</h2>
-              <div className="text-sm text-gray-600">
-                Anzahl: <span className="font-semibold">{players.length}</span>
-              </div>
-            </div>
-
-            <div className="mt-4 flex gap-2">
-              <input
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") addPlayer();
-                }}
-                placeholder="Name hinzufügen"
-                className="w-full rounded-xl border border-gray-300 bg-white px-3 py-2 outline-none focus:border-gray-400"
-              />
-              <button
-                onClick={addPlayer}
-                disabled={!canAdd}
-                className="rounded-xl bg-black px-4 py-2 font-medium text-white shadow-sm disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                Hinzufügen
-              </button>
-            </div>
-
-            <ul className="mt-4 divide-y divide-gray-100 overflow-hidden rounded-xl border border-gray-100">
-              {sortedPlayers.length === 0 ? (
-                <li className="p-4 text-gray-600">Noch keine Spieler hinzugefügt.</li>
-              ) : (
-                sortedPlayers.map((p) => (
-                  <li key={p.id} className="flex items-center justify-between p-4">
-                    <span className="font-medium">{p.name}</span>
-                    <button
-                      onClick={() => removePlayer(p.id)}
-                      className="rounded-lg border border-gray-200 px-3 py-1 text-sm hover:bg-gray-50"
-                    >
-                      Entfernen
-                    </button>
-                  </li>
-                ))
-              )}
-            </ul>
-
-            <div className="mt-4 rounded-xl bg-gray-50 p-4 text-sm text-gray-700">
-              <div className="font-semibold">Partner-Coverage</div>
-              <p className="mt-1">
-                Aktuell: <span className="font-semibold">{coverage.percent}%</span>{" "}
-                ({coverage.totalPairs - coverage.missingPairs}/{coverage.totalPairs} Paarungen).
-              </p>
-            </div>
-          </section>
-
-          {/* Round Card */}
-          <section className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-gray-200">
-            <div className="flex items-center justify-between">
-              <h2 className="text-lg font-semibold">Aktuelle Runde</h2>
-              <span className="rounded-full bg-gray-100 px-3 py-1 text-xs text-gray-700">
-                Courts: {effectiveCourts}
-              </span>
-            </div>
-
-            <div className="mt-4 flex flex-wrap gap-2">
-              <button
-                onClick={generateRoundFair}
-                disabled={tournamentFinished}
-                className="h-[42px] rounded-xl bg-emerald-600 px-4 py-2 font-medium text-white shadow-sm hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                Neue Runde (fair)
-              </button>
-
-              <button
-                onClick={saveRound}
-                disabled={tournamentFinished || matches.length === 0 || !canSaveCurrentRound()}
-                className="h-[42px] rounded-xl bg-black px-4 py-2 text-sm font-medium text-white shadow-sm disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                Runde speichern
-              </button>
-
-              {savedRounds.length > 0 && (
-                <button
-                  onClick={deleteLastRound}
-                  className="h-[42px] rounded-xl border border-gray-200 bg-white px-4 py-2 text-sm font-medium text-gray-800 shadow-sm hover:bg-gray-50"
-                >
-                  Letzte Runde löschen
-                </button>
-              )}
-
-              {!tournamentFinished && (
-                <button
-                  onClick={endTournamentNow}
-                  className="h-[42px] rounded-xl border border-red-200 bg-white px-4 py-2 text-sm font-medium text-red-700 shadow-sm hover:bg-red-50"
-                >
-                  Turnier beenden
-                </button>
-              )}
-
-              <button
-                onClick={() =>
-                  copyToClipboard(
-                    buildFinalRankingText({
-                      tournamentName,
-                      savedRounds,
-                      totalRanking: totalRanking.map((r) => ({ name: r.name, points: r.points })),
-                      targetRounds,
-                      manualEnded,
-                      extraMode,
-                    }),
-                    "Final Ranking kopiert ✅"
-                  )
-                }
-                className="ml-auto h-[42px] rounded-xl border border-gray-200 bg-white px-4 py-2 text-sm font-medium text-gray-800 shadow-sm hover:bg-gray-50"
-              >
-                Copy Final
-              </button>
-
-              <button
-                onClick={() =>
-                  copyToClipboard(
-                    buildFullReportText({
-                      tournamentName,
-                      savedRounds,
-                      totalRanking: totalRanking.map((r) => ({ name: r.name, points: r.points })),
-                      targetRounds,
-                      manualEnded,
-                      extraMode,
-                    }),
-                    "Turnier-Report kopiert ✅"
-                  )
-                }
-                className="h-[42px] rounded-xl bg-black px-4 py-2 text-sm font-medium text-white shadow-sm hover:opacity-95"
-              >
-                Copy Report
-              </button>
-            </div>
-
-            <div className="mt-5 space-y-3">
-              {matches.length === 0 ? (
-                <div className="rounded-xl border border-dashed border-gray-300 bg-gray-50 p-6 text-sm text-gray-700">
-                  {tournamentFinished ? (
-                    <span>
-                      Turnier beendet. Tippe auf <span className="font-semibold">„Extra-Runden spielen“</span>.
-                    </span>
-                  ) : (
-                    <span>
-                      Keine aktive Runde. Klicke{" "}
-                      <span className="font-semibold">„Neue Runde (fair)“</span>.
-                    </span>
-                  )}
-                </div>
-              ) : (
-                matches.map((m) => {
-                  const r = results[m.court] ?? { scoreA: "", scoreB: "" };
-                  return (
-                    <div
-                      key={m.court}
-                      className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm"
-                    >
-                      <div className="flex items-center justify-between">
-                        <div className="text-sm font-semibold text-gray-800">
-                          Court {m.court}
-                        </div>
-                        <span className="rounded-full bg-gray-100 px-2 py-1 text-xs text-gray-700">
-                          2v2
-                        </span>
-                      </div>
-
-                      <div className="mt-3 grid gap-3 sm:grid-cols-[1fr_auto_1fr] sm:items-center">
-                        <div className="rounded-xl bg-gray-50 p-3">
-                          <div className="text-xs font-semibold text-gray-600">Team A</div>
-                          <div className="mt-1 font-medium">
-                            {m.teamA[0].name} & {m.teamA[1].name}
-                          </div>
-
-                          <div className="mt-3 flex items-center gap-2">
-                            <label className="text-xs font-semibold text-gray-600">
-                              Punkte
-                            </label>
-                            <input
-                              inputMode="numeric"
-                              type="number"
-                              min={0}
-                              value={r.scoreA}
-                              onChange={(e) =>
-                                updateScore(m.court, "A", e.target.value)
-                              }
-                              className="w-24 rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none focus:border-gray-400"
-                              placeholder="z.B. 21"
-                            />
-                          </div>
-                        </div>
-
-                        <div className="mx-auto text-sm font-semibold text-gray-500">
-                          VS
-                        </div>
-
-                        <div className="rounded-xl bg-gray-50 p-3">
-                          <div className="text-xs font-semibold text-gray-600">Team B</div>
-                          <div className="mt-1 font-medium">
-                            {m.teamB[0].name} & {m.teamB[1].name}
-                          </div>
-
-                          <div className="mt-3 flex items-center gap-2">
-                            <label className="text-xs font-semibold text-gray-600">
-                              Punkte
-                            </label>
-                            <input
-                              inputMode="numeric"
-                              type="number"
-                              min={0}
-                              value={r.scoreB}
-                              onChange={(e) =>
-                                updateScore(m.court, "B", e.target.value)
-                              }
-                              className="w-24 rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none focus:border-gray-400"
-                              placeholder="z.B. 15"
-                            />
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                  );
-                })
-              )}
-            </div>
-
-            {matches.length > 0 && unusedPlayers.length > 0 && (
-              <div className="mt-4 rounded-xl bg-amber-50 p-4 text-sm text-amber-900 ring-1 ring-amber-200">
-                <div className="font-semibold">Pause (nicht eingeteilt)</div>
-                <div className="mt-1">{unusedPlayers.map((p) => p.name).join(", ")}</div>
-              </div>
-            )}
-
-            <div className="mt-5 rounded-2xl bg-white p-4 ring-1 ring-gray-200">
-              <div className="flex items-center justify-between">
-                <div className="text-sm font-semibold">Rangliste (aktuelle Runde)</div>
-                {!anyCurrentResultEntered && (
-                  <span className="rounded-full bg-gray-100 px-3 py-1 text-xs text-gray-700">
-                    Noch keine Ergebnisse
-                  </span>
-                )}
-              </div>
-
-              <div className="mt-3 overflow-hidden rounded-xl border border-gray-100">
-                <table className="w-full text-left text-sm">
-                  <thead className="bg-gray-50 text-gray-700">
-                    <tr>
-                      <th className="px-4 py-3 font-semibold">#</th>
-                      <th className="px-4 py-3 font-semibold">Spieler</th>
-                      <th className="px-4 py-3 font-semibold">Punkte</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-gray-100">
-                    {currentRoundRanking.map((row, idx) => (
-                      <tr key={row.id} className="bg-white">
-                        <td className="px-4 py-3 font-medium text-gray-700">{idx + 1}</td>
-                        <td className="px-4 py-3 font-medium">{row.name}</td>
-                        <td className="px-4 py-3 font-semibold">{row.points}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </section>
         </div>
-
-        <div className="mt-6 grid gap-6 lg:grid-cols-2">
-          <section className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-gray-200">
-            <div className="flex items-center justify-between">
-              <div>
-                <h2 className="text-lg font-semibold">Gespeicherte Runden</h2>
-                <p className="mt-1 text-sm text-gray-600">
-                  Fairness basiert auf deinen gespeicherten Runden.
-                </p>
-              </div>
-              <span className="rounded-full bg-gray-100 px-3 py-1 text-xs text-gray-700">
-                {savedRounds.length} Runde(n)
-              </span>
-            </div>
-
-            <div className="mt-4 space-y-3">
-              {savedRounds.length === 0 ? (
-                <div className="rounded-xl border border-dashed border-gray-300 bg-gray-50 p-6 text-sm text-gray-700">
-                  Noch keine Runde gespeichert.
-                </div>
-              ) : (
-                savedRounds.map((round) => (
-                  <div key={round.id} className="rounded-2xl border border-gray-200 p-4">
-                    <div className="flex items-center justify-between">
-                      <div className="text-sm font-semibold">
-                        Runde {fmtTime(round.createdAt)}
-                      </div>
-                      <div className="text-xs text-gray-600">{round.courts} Court(s)</div>
-                    </div>
-
-                    <div className="mt-3 space-y-2 text-sm">
-                      {round.matches.map((m) => {
-                        const r = round.results[m.court];
-                        return (
-                          <div key={m.court} className="rounded-xl bg-gray-50 p-3">
-                            <div className="flex items-center justify-between">
-                              <div className="text-xs font-semibold text-gray-600">
-                                Court {m.court}
-                              </div>
-                              <div className="text-xs font-semibold text-gray-700">
-                                {r.scoreA}:{r.scoreB}
-                              </div>
-                            </div>
-                            <div className="mt-1 font-medium">
-                              {m.teamA[0].name} & {m.teamA[1].name}{" "}
-                              <span className="text-gray-500">vs</span>{" "}
-                              {m.teamB[0].name} & {m.teamB[1].name}
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-                ))
-              )}
-            </div>
-          </section>
-
-          <section className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-gray-200">
-            <div>
-              <h2 className="text-lg font-semibold">Gesamt-Rangliste</h2>
-              <p className="mt-1 text-sm text-gray-600">
-                Summe aus allen gespeicherten Runden (Americano-Logik).
-              </p>
-            </div>
-
-            <div className="mt-4 overflow-hidden rounded-xl border border-gray-100">
-              <table className="w-full text-left text-sm">
-                <thead className="bg-gray-50 text-gray-700">
-                  <tr>
-                    <th className="px-4 py-3 font-semibold">#</th>
-                    <th className="px-4 py-3 font-semibold">Spieler</th>
-                    <th className="px-4 py-3 font-semibold">Punkte</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-gray-100">
-                  {totalRanking.map((row, idx) => (
-                    <tr key={row.id} className="bg-white">
-                      <td className="px-4 py-3 font-medium text-gray-700">{idx + 1}</td>
-                      <td className="px-4 py-3 font-medium">{row.name}</td>
-                      <td className="px-4 py-3 font-semibold">{row.points}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-
-            <div className="mt-4 rounded-xl bg-gray-50 p-4 text-sm text-gray-700">
-              <div className="font-semibold">Tipp</div>
-              <p className="mt-1">
-                Wenn du nach Ende weiter spielen willst: <span className="font-semibold">Extra-Runden spielen</span>.
-              </p>
-            </div>
-          </section>
+        <div className="flex flex-wrap gap-2">
+          <button
+            onClick={playExtraRounds}
+            className="rounded-xl bg-black px-4 py-2 text-sm font-bold text-white shadow-sm hover:opacity-95"
+          >
+            Extra-Runden
+          </button>
+          <button
+            onClick={() =>
+              copyToClipboard(
+                buildFinalRankingText({
+                  tournamentName,
+                  savedRounds,
+                  totalRanking: totalRanking.map((r) => ({ name: r.name, points: r.points })),
+                  targetRounds,
+                  manualEnded,
+                  extraMode,
+                }),
+                "Final kopiert ✅"
+              )
+            }
+            className="rounded-xl border border-gray-200 bg-white px-4 py-2 text-sm font-bold shadow-sm hover:bg-gray-50"
+          >
+            Copy Final
+          </button>
         </div>
       </div>
-    </main>
+    </div>
+  ) : null;
+
+  // ------------- PLAY TAB -------------
+  const playContent = (
+    <div className="space-y-4">
+      {matches.length === 0 ? (
+        <div className="rounded-2xl border border-dashed border-gray-300 bg-gray-50 p-6 text-sm text-gray-700">
+          {tournamentFinished ? (
+            <>
+              Turnier beendet. Tippe auf <span className="font-semibold">Extra-Runden</span> (unten), um weiterzuspielen.
+            </>
+          ) : (
+            <>
+              Noch keine aktive Runde. Tippe unten auf <span className="font-semibold">Neue Runde</span>.
+            </>
+          )}
+        </div>
+      ) : (
+        matches.map((m) => {
+          const r = results[m.court] ?? { scoreA: 0, scoreB: 0 };
+          return (
+            <div key={m.court} className="rounded-2xl bg-white p-4 shadow-sm ring-1 ring-gray-200">
+              <div className="flex items-center justify-between">
+                <div className="text-sm font-bold">Court {m.court}</div>
+                <span className="rounded-full bg-gray-100 px-3 py-1 text-xs font-semibold text-gray-700">2v2</span>
+              </div>
+
+              <div className="mt-3 grid gap-3">
+                <div className="rounded-2xl bg-gray-50 p-4 ring-1 ring-gray-200">
+                  <div className="text-xs font-semibold text-gray-600">Team A</div>
+                  <div className="mt-1 text-base font-bold">
+                    {m.teamA[0].name} <span className="text-gray-400">&</span> {m.teamA[1].name}
+                  </div>
+                  <div className="mt-3">
+                    <ScorePill
+                      label="Punkte"
+                      value={r.scoreA}
+                      onChange={(v) => updateScore(m.court, "A", v)}
+                    />
+                  </div>
+                </div>
+
+                <div className="text-center text-xs font-bold tracking-widest text-gray-400">VS</div>
+
+                <div className="rounded-2xl bg-gray-50 p-4 ring-1 ring-gray-200">
+                  <div className="text-xs font-semibold text-gray-600">Team B</div>
+                  <div className="mt-1 text-base font-bold">
+                    {m.teamB[0].name} <span className="text-gray-400">&</span> {m.teamB[1].name}
+                  </div>
+                  <div className="mt-3">
+                    <ScorePill
+                      label="Punkte"
+                      value={r.scoreB}
+                      onChange={(v) => updateScore(m.court, "B", v)}
+                    />
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        })
+      )}
+
+      {matches.length > 0 && unusedPlayers.length > 0 ? (
+        <div className="rounded-2xl bg-amber-50 p-4 text-sm text-amber-900 ring-1 ring-amber-200">
+          <div className="font-bold">Pause</div>
+          <div className="mt-1">{unusedPlayers.map((p) => p.name).join(", ")}</div>
+        </div>
+      ) : null}
+
+      {!tournamentFinished ? (
+        <div className="grid grid-cols-2 gap-2">
+          <button
+            onClick={deleteLastRound}
+            disabled={savedRounds.length === 0}
+            className="rounded-2xl border border-gray-200 bg-white px-4 py-3 text-sm font-bold shadow-sm hover:bg-gray-50 disabled:opacity-40"
+          >
+            Letzte löschen
+          </button>
+          <button
+            onClick={endTournamentNow}
+            className="rounded-2xl border border-red-200 bg-white px-4 py-3 text-sm font-bold text-red-700 shadow-sm hover:bg-red-50"
+          >
+            Turnier beenden
+          </button>
+        </div>
+      ) : null}
+    </div>
+  );
+
+  // ------------- RANKING TAB -------------
+  const rankingContent = (
+    <div className="space-y-5">
+      <section className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-gray-200">
+        <div className="flex items-center justify-between">
+          <div>
+            <div className="text-sm font-bold">Live Ranking (aktive Runde)</div>
+            <div className="mt-1 text-xs text-gray-600">Nur auf Basis der aktuellen Scores.</div>
+          </div>
+        </div>
+
+        <div className="mt-4 space-y-2">
+          {currentRoundRanking.map((r, i) => (
+            <div key={r.id} className="flex items-center justify-between rounded-xl bg-gray-50 px-4 py-3">
+              <div className="flex items-center gap-3">
+                <div className="w-7 text-sm font-black text-gray-500">{i + 1}</div>
+                <div className="font-bold">{r.name}</div>
+              </div>
+              <div className="text-sm font-black">{r.points}</div>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-gray-200">
+        <div>
+          <div className="text-sm font-bold">Gesamt Ranking</div>
+          <div className="mt-1 text-xs text-gray-600">Summe aus gespeicherten Runden.</div>
+        </div>
+
+        <div className="mt-4 space-y-2">
+          {totalRanking.map((r, i) => (
+            <div key={r.id} className="flex items-center justify-between rounded-xl bg-gray-50 px-4 py-3">
+              <div className="flex items-center gap-3">
+                <div className="w-7 text-sm font-black text-gray-500">{i + 1}</div>
+                <div className="font-bold">{r.name}</div>
+              </div>
+              <div className="text-sm font-black">{r.points}</div>
+            </div>
+          ))}
+        </div>
+      </section>
+    </div>
+  );
+
+  // ------------- HISTORY TAB -------------
+  const historyContent = (
+    <div className="space-y-5">
+      <section className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-gray-200">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <div className="text-sm font-bold">Share</div>
+            <div className="mt-1 text-xs text-gray-600">WhatsApp/Copy Export.</div>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <button
+              onClick={() =>
+                copyToClipboard(
+                  buildFinalRankingText({
+                    tournamentName,
+                    savedRounds,
+                    totalRanking: totalRanking.map((r) => ({ name: r.name, points: r.points })),
+                    targetRounds,
+                    manualEnded,
+                    extraMode,
+                  }),
+                  "Final kopiert ✅"
+                )
+              }
+              className="rounded-xl border border-gray-200 bg-white px-4 py-2 text-sm font-bold shadow-sm hover:bg-gray-50"
+            >
+              Copy Final
+            </button>
+            <button
+              onClick={() =>
+                copyToClipboard(
+                  buildFullReportText({
+                    tournamentName,
+                    savedRounds,
+                    totalRanking: totalRanking.map((r) => ({ name: r.name, points: r.points })),
+                    targetRounds,
+                    manualEnded,
+                    extraMode,
+                  }),
+                  "Report kopiert ✅"
+                )
+              }
+              className="rounded-xl bg-black px-4 py-2 text-sm font-bold text-white shadow-sm hover:opacity-95"
+            >
+              Copy Report
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <section className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-gray-200">
+        <div className="flex items-center justify-between">
+          <div>
+            <div className="text-sm font-bold">Runden History</div>
+            <div className="mt-1 text-xs text-gray-600">Basis für Fairness & Coverage.</div>
+          </div>
+          <span className="rounded-full bg-gray-100 px-3 py-1 text-xs font-semibold text-gray-700">
+            {savedRounds.length} Runde(n)
+          </span>
+        </div>
+
+        <div className="mt-4 space-y-3">
+          {savedRounds.length === 0 ? (
+            <div className="rounded-2xl border border-dashed border-gray-300 bg-gray-50 p-6 text-sm text-gray-700">
+              Noch keine Runde gespeichert.
+            </div>
+          ) : (
+            savedRounds.map((round) => (
+              <div key={round.id} className="rounded-2xl bg-gray-50 p-4 ring-1 ring-gray-200">
+                <div className="flex items-center justify-between">
+                  <div className="text-sm font-black">Runde {fmtTime(round.createdAt)}</div>
+                  <div className="text-xs font-semibold text-gray-600">{round.courts} Court(s)</div>
+                </div>
+
+                <div className="mt-3 space-y-2 text-sm">
+                  {round.matches.map((m) => {
+                    const r = round.results[m.court];
+                    return (
+                      <div key={m.court} className="rounded-xl bg-white p-3 ring-1 ring-gray-200">
+                        <div className="flex items-center justify-between">
+                          <div className="text-xs font-bold text-gray-600">Court {m.court}</div>
+                          <div className="text-xs font-black text-gray-800">
+                            {r.scoreA}:{r.scoreB}
+                          </div>
+                        </div>
+                        <div className="mt-1 font-semibold">
+                          {m.teamA[0].name} & {m.teamA[1].name}{" "}
+                          <span className="text-gray-400">vs</span>{" "}
+                          {m.teamB[0].name} & {m.teamB[1].name}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      </section>
+    </div>
+  );
+
+  return (
+    <PageShell title={tournamentName} subtitle={headerSubtitle} topRight={topRight} bottomBar={bottomBar}>
+      {finishedBanner}
+
+      {/* mini status card */}
+      <div className="mb-4 rounded-2xl bg-white p-4 shadow-sm ring-1 ring-gray-200">
+        <div className="flex items-center justify-between">
+          <div>
+            <div className="text-xs font-semibold text-gray-600">Partner-Coverage</div>
+            <div className="mt-1 text-lg font-black">{coverage.percent}%</div>
+          </div>
+          <div className="text-right">
+            <div className="text-xs font-semibold text-gray-600">Paarungen</div>
+            <div className="mt-1 text-sm font-black">
+              {coverage.totalPairs - coverage.missingPairs}/{coverage.totalPairs}
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-3 h-2 overflow-hidden rounded-full bg-gray-100">
+          <div
+            className="h-full rounded-full bg-black"
+            style={{ width: `${coverage.percent}%` }}
+          />
+        </div>
+      </div>
+
+      {activeTab === "play" ? playContent : null}
+      {activeTab === "ranking" ? rankingContent : null}
+      {activeTab === "history" ? historyContent : null}
+    </PageShell>
   );
 }
