@@ -24,18 +24,14 @@ type PersistedStateV4 = {
   courts: number;
   targetRounds: number;
 
-  // tournament lifecycle
   manualEnded: boolean;
   extraMode: boolean;
 
-  // active round
   matches: Match[];
   results: Record<number, MatchResult>;
 
-  // history
   savedRounds: SavedRound[];
 
-  // ui
   activeTab: "play" | "ranking" | "history";
 };
 
@@ -61,7 +57,6 @@ function fmtTime(ts: number) {
   return `${hh}:${mm}`;
 }
 
-// --- Partner-Coverage (unique partnerships) ---
 function partnerCoverage(players: Player[], savedRounds: SavedRound[]) {
   const n = players.length;
   if (n <= 1) return { complete: true, percent: 100, missingPairs: 0, totalPairs: 0 };
@@ -82,17 +77,14 @@ function partnerCoverage(players: Player[], savedRounds: SavedRound[]) {
   return { complete: done >= totalPairs, percent, missingPairs, totalPairs };
 }
 
-// Recommended rounds lower bound for partner coverage with court capacity
 function recommendRoundsPartner(playerCount: number, courts: number) {
   if (playerCount < 4) return 0;
   const c = Math.max(1, Math.min(courts, Math.floor(playerCount / 4) || 1));
-  // ceil( n*(n-1) / (4*c) )
   const num = playerCount * (playerCount - 1);
   const den = 4 * c;
   return Math.max(1, Math.ceil(num / den));
 }
 
-// --- Fair round generator (partner-first) ---
 function computeStats(players: Player[], savedRounds: SavedRound[]) {
   const gamesPlayed: Record<string, number> = {};
   const partnerCount: Record<string, number> = {};
@@ -143,12 +135,10 @@ function generateFairRound(params: { players: Player[]; courtsWanted: number; sa
 
   const { gamesPlayed, partnerCount, opponentCount } = computeStats(players, savedRounds);
 
-  // Let low-games players play first (bench rotation fairness)
   const shuffled = [...players].sort(() => Math.random() - 0.5);
   const byGames = shuffled.sort((a, b) => (gamesPlayed[a.id] ?? 0) - (gamesPlayed[b.id] ?? 0));
 
   const active = byGames.slice(0, slots);
-  const bench = byGames.slice(slots);
 
   const remaining = [...active];
 
@@ -157,12 +147,9 @@ function generateFairRound(params: { players: Player[]; courtsWanted: number; sa
   const gp = (x: string) => gamesPlayed[x] ?? 0;
 
   function matchScore(a: Player, b: Player, c: Player, d: Player) {
-    // Partner repeats hurt most (partner coverage goal)
     const partnerPenalty = 14 * partner(a.id, b.id) + 14 * partner(c.id, d.id);
-    // Opponent repeats mild penalty
     const opponentPenalty =
       3 * (opp(a.id, c.id) + opp(a.id, d.id) + opp(b.id, c.id) + opp(b.id, d.id));
-    // Small bonus for players with fewer games
     const playtimeBonus = -0.25 * (gp(a.id) + gp(b.id) + gp(c.id) + gp(d.id));
     return partnerPenalty + opponentPenalty + playtimeBonus;
   }
@@ -215,10 +202,11 @@ function generateFairRound(params: { players: Player[]; courtsWanted: number; sa
     });
   }
 
+  const bench = byGames.slice(slots);
+
   return { matches, bench };
 }
 
-// ---- EXPORT HELPERS ----
 function buildFinalRankingText(params: {
   tournamentName: string;
   savedRounds: SavedRound[];
@@ -415,7 +403,11 @@ export default function Home() {
   // Setup
   const [setupDone, setSetupDone] = useState(false);
   const [tournamentName, setTournamentName] = useState("Mein Americano");
+
+  // ✅ FIX: Text-State fürs mobile-friendly Tippen
   const [setupPlayerCount, setSetupPlayerCount] = useState(8);
+  const [setupPlayerCountText, setSetupPlayerCountText] = useState("8");
+
   const [setupNames, setSetupNames] = useState<string[]>(Array.from({ length: 8 }, () => ""));
   const [setupCourts, setSetupCourts] = useState(2);
   const [targetRounds, setTargetRounds] = useState(recommendRoundsPartner(8, 2));
@@ -605,6 +597,7 @@ export default function Home() {
     setTournamentName("Mein Americano");
 
     setSetupPlayerCount(8);
+    setSetupPlayerCountText("8");
     setSetupNames(Array.from({ length: 8 }, () => ""));
     setSetupCourts(2);
     setTargetRounds(recommendRoundsPartner(8, 2));
@@ -627,15 +620,22 @@ export default function Home() {
   function startTournamentFromSetup() {
     setError("");
 
+    // ✅ FIX: finalCount aus Text ableiten + validieren
+    const rawCount = Number(setupPlayerCountText);
+    const finalCount = Number.isFinite(rawCount) && rawCount > 0 ? Math.max(4, rawCount) : 8;
+
+    // sync states
+    if (finalCount !== setupPlayerCount) setSetupPlayerCount(finalCount);
+    if (String(finalCount) !== setupPlayerCountText) setSetupPlayerCountText(String(finalCount));
+
     const tName = tournamentName.trim();
-    const names = setupNames.map((n) => n.trim());
+    const names = setupNames.slice(0, finalCount).map((n) => n.trim());
 
     if (tName.length < 2) return setError("Bitte einen Turniernamen eingeben.");
-    if (setupPlayerCount < 4) return setError("Mindestens 4 Spieler:innen.");
+    if (finalCount < 4) return setError("Mindestens 4 Spieler:innen.");
 
-    if (names.some((n) => n.length === 0)) {
-      return setError("Bitte alle Namen eintragen (oder Auto-Fill nutzen).");
-    }
+    if (names.length !== finalCount) return setError("Spieler:innen Anzahl passt nicht. Tippe kurz ins Feld und raus.");
+    if (names.some((n) => n.length === 0)) return setError("Bitte alle Namen eintragen (oder Auto-Fill nutzen).");
 
     const newPlayers: Player[] = names.map((n) => ({ id: crypto.randomUUID(), name: n }));
     const maxPossible = Math.max(1, Math.floor(newPlayers.length / 4));
@@ -814,12 +814,26 @@ export default function Home() {
 
             <div className="mt-4">
               <label className="text-sm font-semibold text-gray-700">Anzahl</label>
+
+              {/* ✅ FIX: freies Tippen (auch leer), Validation erst onBlur */}
               <input
-                type="number"
-                min={4}
-                value={setupPlayerCount}
-                onChange={(e) => setSetupPlayerCount(Math.max(4, Number(e.target.value)))}
+                inputMode="numeric"
+                pattern="[0-9]*"
+                value={setupPlayerCountText}
+                onFocus={(e) => e.currentTarget.select()}
+                onChange={(e) => {
+                  const raw = e.target.value;
+                  const digitsOnly = raw.replace(/[^\d]/g, "");
+                  setSetupPlayerCountText(digitsOnly);
+                }}
+                onBlur={() => {
+                  const n = Number(setupPlayerCountText);
+                  const fixed = Number.isFinite(n) && n > 0 ? Math.max(4, n) : 8;
+                  setSetupPlayerCount(fixed);
+                  setSetupPlayerCountText(String(fixed));
+                }}
                 className="mt-2 w-full rounded-xl border border-gray-300 bg-white px-3 py-3 text-base outline-none focus:border-gray-400"
+                placeholder="z.B. 6"
               />
             </div>
 
@@ -912,10 +926,8 @@ export default function Home() {
         </div>
       ) : null}
 
-      {/* App-like segmented nav */}
       <Segmented value={activeTab} onChange={setActiveTab} />
 
-      {/* Primary actions for Play screen */}
       {activeTab === "play" ? (
         <div className="grid grid-cols-2 gap-2">
           <button
@@ -946,7 +958,6 @@ export default function Home() {
     </button>
   );
 
-  // Turnier finished banner (shown on all tabs)
   const finishedBanner = tournamentFinished ? (
     <div className="mb-4 rounded-2xl bg-white p-4 shadow-sm ring-1 ring-gray-200">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
@@ -988,7 +999,6 @@ export default function Home() {
     </div>
   ) : null;
 
-  // ------------- PLAY TAB -------------
   const playContent = (
     <div className="space-y-4">
       {matches.length === 0 ? (
@@ -1020,11 +1030,7 @@ export default function Home() {
                     {m.teamA[0].name} <span className="text-gray-400">&</span> {m.teamA[1].name}
                   </div>
                   <div className="mt-3">
-                    <ScorePill
-                      label="Punkte"
-                      value={r.scoreA}
-                      onChange={(v) => updateScore(m.court, "A", v)}
-                    />
+                    <ScorePill label="Punkte" value={r.scoreA} onChange={(v) => updateScore(m.court, "A", v)} />
                   </div>
                 </div>
 
@@ -1036,11 +1042,7 @@ export default function Home() {
                     {m.teamB[0].name} <span className="text-gray-400">&</span> {m.teamB[1].name}
                   </div>
                   <div className="mt-3">
-                    <ScorePill
-                      label="Punkte"
-                      value={r.scoreB}
-                      onChange={(v) => updateScore(m.court, "B", v)}
-                    />
+                    <ScorePill label="Punkte" value={r.scoreB} onChange={(v) => updateScore(m.court, "B", v)} />
                   </div>
                 </div>
               </div>
@@ -1076,15 +1078,12 @@ export default function Home() {
     </div>
   );
 
-  // ------------- RANKING TAB -------------
   const rankingContent = (
     <div className="space-y-5">
       <section className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-gray-200">
-        <div className="flex items-center justify-between">
-          <div>
-            <div className="text-sm font-bold">Live Ranking (aktive Runde)</div>
-            <div className="mt-1 text-xs text-gray-600">Nur auf Basis der aktuellen Scores.</div>
-          </div>
+        <div>
+          <div className="text-sm font-bold">Live Ranking (aktive Runde)</div>
+          <div className="mt-1 text-xs text-gray-600">Nur auf Basis der aktuellen Scores.</div>
         </div>
 
         <div className="mt-4 space-y-2">
@@ -1121,7 +1120,6 @@ export default function Home() {
     </div>
   );
 
-  // ------------- HISTORY TAB -------------
   const historyContent = (
     <div className="space-y-5">
       <section className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-gray-200">
@@ -1224,10 +1222,47 @@ export default function Home() {
   );
 
   return (
-    <PageShell title={tournamentName} subtitle={headerSubtitle} topRight={topRight} bottomBar={bottomBar}>
+    <PageShell title={tournamentName} subtitle={headerSubtitle} topRight={topRight} bottomBar={(() => {
+      const bar = (
+        <div className="space-y-3">
+          {toast ? (
+            <div className="rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm font-semibold text-emerald-900">
+              {toast}
+            </div>
+          ) : null}
+
+          {error ? (
+            <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-semibold text-red-800">
+              {error}
+            </div>
+          ) : null}
+
+          <Segmented value={activeTab} onChange={setActiveTab} />
+
+          {activeTab === "play" ? (
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                onClick={generateRoundFair}
+                disabled={tournamentFinished}
+                className="rounded-2xl bg-emerald-600 px-4 py-4 text-base font-bold text-white shadow-sm hover:bg-emerald-700 disabled:opacity-40"
+              >
+                Neue Runde
+              </button>
+              <button
+                onClick={saveRound}
+                disabled={tournamentFinished || !canSaveCurrentRound}
+                className="rounded-2xl bg-black px-4 py-4 text-base font-bold text-white shadow-sm hover:opacity-95 disabled:opacity-40"
+              >
+                Speichern
+              </button>
+            </div>
+          ) : null}
+        </div>
+      );
+      return bar;
+    })()}>
       {finishedBanner}
 
-      {/* mini status card */}
       <div className="mb-4 rounded-2xl bg-white p-4 shadow-sm ring-1 ring-gray-200">
         <div className="flex items-center justify-between">
           <div>
@@ -1243,10 +1278,7 @@ export default function Home() {
         </div>
 
         <div className="mt-3 h-2 overflow-hidden rounded-full bg-gray-100">
-          <div
-            className="h-full rounded-full bg-black"
-            style={{ width: `${coverage.percent}%` }}
-          />
+          <div className="h-full rounded-full bg-black" style={{ width: `${coverage.percent}%` }} />
         </div>
       </div>
 
